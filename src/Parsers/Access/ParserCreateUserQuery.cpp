@@ -827,6 +827,9 @@ bool ParserCreateUserQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     query->add_identified_with = parsed_add_identified_with;
     query->replace_authentication_methods = parsed_identified_with;
 
+    if (query->names && query->names->hasQueryParameters())
+        query->children.push_back(query->names);
+
     for (const auto & authentication_method : query->authentication_methods)
     {
         query->children.push_back(authentication_method);

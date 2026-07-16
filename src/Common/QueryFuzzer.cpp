@@ -8637,7 +8637,7 @@ void QueryFuzzer::collectFuzzInfoRecurse(ASTPtr ast)
     {
         addColumnLike(ast);
     }
-    else if (typeid_cast<ASTIdentifier *>(ast.get()))
+    else if (const auto * identifier = typeid_cast<ASTIdentifier *>(ast.get()); identifier && !identifier->isParam())
     {
         addColumnLike(ast);
     }
