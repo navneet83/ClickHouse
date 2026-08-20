@@ -59,6 +59,7 @@ fast_test_digest_config = Job.CacheDigestConfig(
     include_paths=[
         "./ci/jobs/fast_test.py",
         "./ci/jobs/scripts/clickhouse_proc.py",
+        "./ci/jobs/scripts/log_cluster.py",
         "./ci/jobs/scripts/server_cleanup.py",
         "./tests/queries/0_stateless/",
         "./tests/config/",
@@ -108,6 +109,7 @@ common_ft_job_config = Job.Config(
         include_paths=[
             "./ci/jobs/functional_tests.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/log_cluster.py",
             "./ci/jobs/scripts/server_cleanup.py",
             "./ci/jobs/scripts/functional_tests_results.py",
             "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
@@ -145,6 +147,7 @@ common_stress_job_config = Job.Config(
             "./tests/queries/0_stateless/",
             "./ci/jobs/stress_job.py",
             "./ci/jobs/scripts/clickhouse_proc.py",
+            "./ci/jobs/scripts/log_cluster.py",
             "./ci/jobs/scripts/stress/stress.py",
             "./tests/clickhouse-test",
             "./tests/config",
@@ -1562,6 +1565,7 @@ class JobConfigs:
                 # clears leftover processes through `server_cleanup.py`. Track
                 # both so changes to the shared start path reschedule the job.
                 "./ci/jobs/scripts/clickhouse_proc.py",
+                "./ci/jobs/scripts/log_cluster.py",
                 "./ci/jobs/scripts/server_cleanup.py",
                 "./ci/jobs/scripts/clickbench/",
                 "./ci/jobs/scripts/clickhouse_service.py",
@@ -1762,7 +1766,9 @@ class JobConfigs:
         digest_config=Job.CacheDigestConfig(
             include_paths=[
                 "./ci/jobs/sqlstorm_test.py",
+                "./ci/jobs/scripts/log_cluster.py",
                 "./ci/jobs/scripts/server_cleanup.py",
+                "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
                 "./tests/sqlstorm/",
             ],
         ),

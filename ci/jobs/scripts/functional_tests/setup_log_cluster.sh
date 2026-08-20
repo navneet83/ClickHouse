@@ -14,7 +14,10 @@ set -e
 # Pre-configured destination cluster, where to export the data
 CLICKHOUSE_CI_LOGS_CLUSTER=${CLICKHOUSE_CI_LOGS_CLUSTER:-system_logs_export}
 
-EXTRA_COLUMNS=${EXTRA_COLUMNS:-"repo LowCardinality(String), pull_request_number UInt32, commit_sha String, check_start_time DateTime('UTC'), check_name LowCardinality(String), instance_type LowCardinality(String), instance_id String, INDEX ix_repo (repo) TYPE set(100), INDEX ix_pr (pull_request_number) TYPE set(100), INDEX ix_commit (commit_sha) TYPE set(100), INDEX ix_check_time (check_start_time) TYPE minmax, "}
+# Both are built from LogCluster.META_COLUMNS (ci/jobs/scripts/log_cluster.py)
+# and exported by the job that runs this script. A default here would be a
+# second definition free to drift from the expression it must match.
+echo "EXTRA_COLUMNS=${EXTRA_COLUMNS:?}"
 echo "EXTRA_COLUMNS_EXPRESSION=${EXTRA_COLUMNS_EXPRESSION:?}"
 EXTRA_ORDER_BY_COLUMNS=${EXTRA_ORDER_BY_COLUMNS:-"check_name"}
 
