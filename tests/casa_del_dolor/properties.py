@@ -1478,7 +1478,11 @@ class DatabaseReplicatedGroup(PropertiesGroup):
             "internal_replication": true_false_lambda,
             "logs_to_keep": threshold_generator(0.2, 0.2, 0, 3000),
             "max_broken_tables_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
-            "max_replication_lag_to_enqueue": threshold_generator(0.2, 0.2, 1, 200),
+            # No unlimited: the server adds it to a log pointer, and 2**64-1 wraps the sum,
+            # marking a synced replica unsynced (LOGICAL_ERROR 'our_log_ptr < max_log_ptr').
+            "max_replication_lag_to_enqueue": threshold_generator(
+                0.2, 0.2, 1, 200, allow_unlimited=False
+            ),
         }
         apply_properties_recursively(property_element, replicated_settings, 0)
 
