@@ -40,6 +40,7 @@ from generators import Generator, BuzzHouseGenerator
 from leaks import ElOracloDeLeaks
 from oracles import ElOraculoDeTablas
 from properties import (
+    SERVER_STOP_WAIT_SECONDS,
     modify_server_settings,
     modify_user_settings,
     modify_keeper_settings,
@@ -708,7 +709,9 @@ while all_running and (not reached_limit):
         )
 
         try:
-            next_pick.stop_clickhouse(stop_wait_sec=30, kill=kill_server)
+            next_pick.stop_clickhouse(
+                stop_wait_sec=SERVER_STOP_WAIT_SECONDS, kill=kill_server
+            )
         except Exception as ex:
             logger.error(f"Failed to stop ClickHouse: {ex}")
             logger.info(f"The server {next_pick.name} is not running")
@@ -785,12 +788,21 @@ while all_running and (not reached_limit):
 
 good_exit = True
 
-# Check load generator first
-if client.process.poll() is None:
+# Check load generator first. The codes `validate_exit_code` accepts only mean "as expected"
+# when the kill below is what ended the run; a generator that died on its own reports the same
+# ones and must still fail.
+killed_during_cleanup = client.process.poll() is None
+if killed_during_cleanup:
     client.process.kill()
     client.process.wait()
 logger.info(f"{generator.name} exited with code: {client.process.returncode}")
-good_exit = generator.validate_exit_code(client.process.returncode)
+if killed_during_cleanup:
+    good_exit = generator.validate_exit_code(client.process.returncode)
+elif client.process.returncode != 0:
+    logger.error(
+        f"{generator.name} exited on its own with code {client.process.returncode} before the run finished"
+    )
+    good_exit = False
 
 for server in servers:
     # First check if not running
@@ -805,7 +817,7 @@ for server in servers:
             )
             good_exit = False
     else:
-        server.stop_clickhouse(stop_wait_sec=30, kill=False)
+        server.stop_clickhouse(stop_wait_sec=SERVER_STOP_WAIT_SECONDS, kill=False)
         if server.get_process_pid("clickhouse") is not None:
             logger.warning(
                 f"Instance {server.name} is still running after stop command"

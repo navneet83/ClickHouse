@@ -19,7 +19,7 @@ from ci.jobs.ast_fuzzer_job import (
 from ci.jobs.buzzhouse_job import generate_buzz_config
 from ci.jobs.scripts.clickhouse_service import ClickHouseService
 from ci.jobs.scripts.integration_tests_configs import IMAGES_ENV
-from ci.jobs.scripts.log_parser import FuzzerLogParser
+from ci.jobs.scripts.log_parser import EXPECTED_KILL_PATTERN, FuzzerLogParser
 from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.utils import Shell, Utils
@@ -280,6 +280,20 @@ def _classify_rotated_logs(
     ):
         return None, True
     return None, False
+
+
+def _is_expected_kill_only_failure(result: Result) -> bool:
+    """True when the only thing `analyze_job_logs` failed on is Dolor's own end-of-run
+    `SIGKILL` line.
+
+    `parse_failure(allow_expected_only=True)` names a run after that line when nothing else
+    matched, and the name it builds is the matched line itself. Such a verdict identifies
+    nothing, so it must not shadow the teardown verdict the caller can report instead.
+    """
+    if result.is_ok() or not result.results:
+        return False
+    failing = [sub for sub in result.results if not sub.is_ok()]
+    return bool(failing) and all(EXPECTED_KILL_PATTERN in sub.name for sub in failing)
 
 
 def _classify_failed_run(
@@ -889,11 +903,17 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
         True,
         error_logs=error_logs,
     )
-    if not cmd_ok and result.is_ok():
+    # A teardown failure also reaches here already failing, named after the expected kill line
+    # that the forced stop itself wrote. Let it be reclassified too, but only with a teardown
+    # verdict to put in its place, so a nameless parser verdict is never traded for a vaguer one.
+    expected_kill_only = (
+        forced_stop or stop_failed
+    ) and _is_expected_kill_only_failure(result)
+    if not cmd_ok and (result.is_ok() or expected_kill_only):
         failed_result, info_override = _classify_failed_run(
             result.info, rotated_logs, buzz_out, sw, forced_stop, stop_failed
         )
-        if info_override:
+        if info_override and not expected_kill_only:
             print(info_override)
             result.set_info(info_override)
         if failed_result is not None:
