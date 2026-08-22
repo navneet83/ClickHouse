@@ -16,10 +16,14 @@ EXPECTED_KILL_PATTERN = "Child process was terminated by signal 9"
 # A sanitizer report that is an out-of-memory rather than a bug. Defined here, not in the
 # job scripts, because the parser has to recognise one to keep it from masking a real
 # failure; `ast_fuzzer_job` re-exports it for the OOM classifier.
-SANITIZER_OOM_PATTERN = (
+SANITIZER_OOM_REPORT_PATTERN = (
     "Sanitizer:? (out-of-memory|out of memory|failed to allocate)"
-    f"|{EXPECTED_KILL_PATTERN}"
 )
+
+# The report plus the expected SIGKILL: every line here is benign on its own. Use this to
+# filter benign lines out of a failure scan, never to prove an OOM happened - the kill line
+# alone is a healthy teardown, and only exit code 137 distinguishes a kernel OOM from it.
+SANITIZER_OOM_PATTERN = f"{SANITIZER_OOM_REPORT_PATTERN}|{EXPECTED_KILL_PATTERN}"
 
 
 class FuzzerLogParser:

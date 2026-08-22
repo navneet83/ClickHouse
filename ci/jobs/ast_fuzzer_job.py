@@ -10,7 +10,11 @@ from pathlib import Path
 from ci.jobs.scripts.clickhouse_service import ClickHouseService
 from ci.jobs.scripts.find_tests import Targeting
 from ci.jobs.scripts.docker_image import DockerImage
-from ci.jobs.scripts.log_parser import SANITIZER_OOM_PATTERN, FuzzerLogParser
+from ci.jobs.scripts.log_parser import (
+    SANITIZER_OOM_PATTERN,
+    SANITIZER_OOM_REPORT_PATTERN,
+    FuzzerLogParser,
+)
 from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.utils import Shell, Utils
@@ -298,7 +302,13 @@ def _classify_sanitizer_oom(
     a `<Fatal>` or `Logical error` may reach only clickhouse-server.err.log.
     Returns (is_oom_success, warning_messages).
     """
-    oom_pattern = SANITIZER_OOM_PATTERN
+    # Only a real sanitizer OOM report proves an OOM. The expected SIGKILL line is logged by
+    # a healthy teardown too, so it may not stand in for one here; a kernel OOM that leaves
+    # only that line is recognised by exit code 137 on the `kernel_oom_kill` path below.
+    oom_pattern = SANITIZER_OOM_REPORT_PATTERN
+    # Wider than `oom_pattern` on purpose: benign lines to drop from the non-OOM scan. The
+    # expected SIGKILL must not veto a genuine OOM either.
+    benign_pattern = SANITIZER_OOM_PATTERN
     non_oom_pattern = SANITIZER_NON_OOM_PATTERN
     oom_nodes = []
     non_oom_failure_found = False
@@ -322,11 +332,12 @@ def _classify_sanitizer_oom(
             oom_nodes.append(i)
         # Run the non-OOM matcher for every node, including OOM-marked ones: a
         # single node can hit both an OOM and a genuine crash, and the real crash
-        # must not be masked by the OOM-is-success path. Drop the OOM lines
+        # must not be masked by the OOM-is-success path. Drop the benign lines
         # themselves (a sanitizer OOM report matches non_oom_pattern via
-        # "AddressSanitizer" etc.) so a pure OOM is not miscounted.
+        # "AddressSanitizer" etc., and the expected SIGKILL via the "Signal"
+        # pattern) so neither is miscounted as a genuine failure.
         non_oom_signal = Shell.get_output(
-            f"rg --text '{non_oom_pattern}' {node_logs} | rg --text -v '{oom_pattern}'"
+            f"rg --text '{non_oom_pattern}' {node_logs} | rg --text -v '{benign_pattern}'"
         )
         if non_oom_signal:
             non_oom_failure_found = True

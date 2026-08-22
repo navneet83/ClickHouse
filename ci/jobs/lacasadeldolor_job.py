@@ -19,7 +19,11 @@ from ci.jobs.ast_fuzzer_job import (
 from ci.jobs.buzzhouse_job import generate_buzz_config
 from ci.jobs.scripts.clickhouse_service import ClickHouseService
 from ci.jobs.scripts.integration_tests_configs import IMAGES_ENV
-from ci.jobs.scripts.log_parser import EXPECTED_KILL_PATTERN, FuzzerLogParser
+from ci.jobs.scripts.log_parser import (
+    EXPECTED_KILL_PATTERN,
+    SANITIZER_OOM_REPORT_PATTERN,
+    FuzzerLogParser,
+)
 from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.utils import Shell, Utils
@@ -33,7 +37,6 @@ temp_path = f"{repo_dir}/ci/tmp"
 GRACEFUL_EXIT_CODES = (0, -15, 143)
 SIGKILL_EXIT_CODES = (137, -9)
 
-EXPECTED_KILL_FATAL = "Child process was terminated by signal 9 (KILL)"
 # `dolor.py` logs this and fails the run when `ClickHouseInstance.stop_clickhouse` had to
 # escalate a graceful shutdown to a `SIGKILL`. That exit is 137 too, so the code alone
 # cannot tell a hung shutdown from a kernel OOM - only this message can.
@@ -271,12 +274,11 @@ def _classify_rotated_logs(
             ),
             False,
         )
-    # `SANITIZER_OOM_PATTERN` also matches the watchdog's SIGKILL fatal, which Dolor writes
-    # on purpose on every killed restart and forced stop. Passing a run needs a real OOM
-    # report, not a line the run was always going to produce. `-F`: the line has parentheses.
+    # Report pattern only: `SANITIZER_OOM_PATTERN` also matches the watchdog's SIGKILL fatal,
+    # which Dolor writes on purpose on every killed restart and forced stop, and passing a run
+    # needs a real OOM report rather than a line the run was always going to produce.
     if Shell.get_output(
-        f"rg -z --text '{SANITIZER_OOM_PATTERN}' {paths_to_scan}"
-        f" | rg --text -vF '{EXPECTED_KILL_FATAL}'"
+        f"rg -z --text '{SANITIZER_OOM_REPORT_PATTERN}' {paths_to_scan}"
     ):
         return None, True
     return None, False
@@ -296,6 +298,18 @@ def _is_expected_kill_only_failure(result: Result) -> bool:
     return bool(failing) and all(EXPECTED_KILL_PATTERN in sub.name for sub in failing)
 
 
+def _has_specific_failure_verdict(
+    forced_stop: bool, stop_failed: bool, generator_early_exit_code: int | None
+) -> bool:
+    """True when `_classify_failed_run` is guaranteed to name the failure itself.
+
+    Only then may an expected-kill-only verdict be handed over for reclassification: each of
+    these produces a named failure there, so a nameless verdict is never traded for a vaguer
+    one - or for no verdict at all.
+    """
+    return forced_stop or stop_failed or generator_early_exit_code is not None
+
+
 def _classify_failed_run(
     result_info: str,
     rotated_logs: list[Path],
@@ -303,6 +317,7 @@ def _classify_failed_run(
     sw: Utils.Stopwatch,
     forced_stop: bool = False,
     stop_failed: bool = False,
+    generator_early_exit_code: int | None = None,
 ) -> tuple[Result | None, str | None]:
     """Decide what a non-zero `dolor.py` exit means when `analyze_job_logs` returned OK.
 
@@ -362,6 +377,26 @@ def _classify_failed_run(
                 )
             ],
             info="A server was still running after the stop command",
+            stopwatch=sw,
+        )
+    # The generator dying before cleanup is its own failure, whatever the servers did: an OOM
+    # in a rotated log explains a server going away, never the generator process exiting on
+    # its own. So it overrides `benign_downgrade` the way the teardown failures above do,
+    # rather than being passed off as the benign OOM that happened to be in the same run.
+    if failed_result is None and generator_early_exit_code is not None:
+        message = (
+            f"The load generator exited on its own with code {generator_early_exit_code} "
+            "before the run finished"
+        )
+        failed_result = Result.create_from(
+            results=[
+                Result(
+                    name="Load generator",
+                    info=f"{message}. Check fuzzer.log.",
+                    status=Result.Status.FAIL,
+                )
+            ],
+            info=message,
             stopwatch=sw,
         )
     if failed_result is None and not benign_downgrade:
@@ -779,6 +814,7 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
     forced_stop = False
     stop_failed = False
     fuzzer_exit_code = 0
+    generator_early_exit_code: int | None = None
     node_exit_codes: list[int] = []
     try:
         pattern1 = re.compile(
@@ -803,6 +839,11 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
         # "The server node0 exited with code: 137". Collect those codes so the sanitizer
         # OOM heuristic in `analyze_job_logs` can still see a kernel `SIGKILL`.
         pattern3 = re.compile(r"The server \S+ exited with code:\s*(-?\d+)")
+        # `dolor.py` logs this only when the generator died before cleanup could kill it.
+        # The numeric code alone cannot show that: a generator killed on purpose reports the
+        # codes `validate_exit_code` accepts, and so does one that died on its own. Match the
+        # stable middle of the message, since the tail has been reworded before.
+        pattern4 = re.compile(r"exited on its own with code\s*(-?\d+)")
 
         with open(dolor_log, "r", encoding="utf-8") as logf:
             for line in logf:
@@ -815,6 +856,9 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
                 e = pattern3.search(line)
                 if e:
                     node_exit_codes.append(int(e.group(1)))
+                g = pattern4.search(line)
+                if g:
+                    generator_early_exit_code = int(g.group(1))
                 if FORCED_STOP_MESSAGE in line:
                     forced_stop = True
                 if STOP_FAILED_MESSAGE in line:
@@ -903,15 +947,22 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
         True,
         error_logs=error_logs,
     )
-    # A teardown failure also reaches here already failing, named after the expected kill line
-    # that the forced stop itself wrote. Let it be reclassified too, but only with a teardown
-    # verdict to put in its place, so a nameless parser verdict is never traded for a vaguer one.
-    expected_kill_only = (
-        forced_stop or stop_failed
+    # A teardown failure, or a generator that died on its own, also reaches here already
+    # failing and named after the expected kill line that the forced stop or the end-of-run
+    # kill wrote. Let those be reclassified too, but only when there is a specific verdict to
+    # put in their place.
+    expected_kill_only = _has_specific_failure_verdict(
+        forced_stop, stop_failed, generator_early_exit_code
     ) and _is_expected_kill_only_failure(result)
     if not cmd_ok and (result.is_ok() or expected_kill_only):
         failed_result, info_override = _classify_failed_run(
-            result.info, rotated_logs, buzz_out, sw, forced_stop, stop_failed
+            result.info,
+            rotated_logs,
+            buzz_out,
+            sw,
+            forced_stop,
+            stop_failed,
+            generator_early_exit_code,
         )
         if info_override and not expected_kill_only:
             print(info_override)
