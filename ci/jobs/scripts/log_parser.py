@@ -35,9 +35,10 @@ class FuzzerLogParser:
     MAX_INLINE_REPRODUCE_COMMANDS = 20
     # Lines of a matched failure reported as the error output.
     MATCH_WINDOW_LINES = 10
-    # How far to read when matches are being skipped. A sanitizer report and its frames
-    # run a few tens of lines, so this covers several before giving up on the log.
-    SCAN_LINES = 200
+    # How many matches to consider when some of them are being skipped. Counted in
+    # matches rather than output lines, so that any number of excluded reports cannot
+    # crowd a real failure out of the window; the cap only bounds the memory used.
+    SCAN_MATCHES = 1000
     SANITIZER_ERROR_PATTERN = (
         r"(SUMMARY|ERROR|WARNING): [a-zA-Z]+Sanitizer:.*|"
         r".*[a-zA-Z]+Sanitizer: CHECK failed:.*"
@@ -176,11 +177,19 @@ class FuzzerLogParser:
                 continue
             # Read past the first match when skipping some, so an excluded report
             # cannot hide the matches behind it; the window is trimmed back below.
-            limit = self.MATCH_WINDOW_LINES if not exclude_pattern else self.SCAN_LINES
-            output = Shell.get_output(
-                f"rg -z --text -A {context_after} -o '{pattern}' {log} | head -n{limit}",
-                strict=False,
-            )
+            # `-m` bounds this by matches, unlike a `head` on the output lines, which
+            # a long enough run of excluded reports would fill on its own.
+            if exclude_pattern:
+                command = (
+                    f"rg -z --text -A {context_after} -o "
+                    f"-m {self.SCAN_MATCHES} '{pattern}' {log}"
+                )
+            else:
+                command = (
+                    f"rg -z --text -A {context_after} -o '{pattern}' {log} "
+                    f"| head -n{self.MATCH_WINDOW_LINES}"
+                )
+            output = Shell.get_output(command, strict=False)
             if not output:
                 continue
             if not exclude_pattern:
@@ -202,7 +211,11 @@ class FuzzerLogParser:
                 None,
             )
             if start is not None:
-                return "\n".join(lines[start : start + self.MATCH_WINDOW_LINES]), log, False
+                return (
+                    "\n".join(lines[start : start + self.MATCH_WINDOW_LINES]),
+                    log,
+                    False,
+                )
         return fallback_output, fallback_log, fallback_output is not None
 
     @staticmethod
