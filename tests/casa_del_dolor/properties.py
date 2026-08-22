@@ -145,15 +145,18 @@ possible_properties = {
     "background_common_pool_size": no_zero_threads_lambda,
     "background_distributed_schedule_pool_size": no_zero_threads_lambda,
     "background_fetches_pool_size": no_zero_threads_lambda,
+    # `background_pool_size * ratio` must be >= 1 or MergeTreeBackgroundExecutor throws
+    # INVALID_CONFIG_PARAMETER at startup. The two ranges below keep 4 * 0.25 = 1 as the
+    # worst case, so they can stay independent lambdas
     # "background_merges_mutations_concurrency_ratio": threshold_generator(
-    #    0.2, 0.2, 0.0, 3.0
+    #    0.2, 0.2, 0.25, 4.0
     # ),
     "background_merges_mutations_scheduling_policy": lambda: random.choice(
         ["round_robin", "shortest_task_first"]
     ),
     "background_message_broker_schedule_pool_size": no_zero_threads_lambda,
     "background_move_pool_size": no_zero_threads_lambda,
-    # "background_pool_size": threads_lambda, has to be in a certain range
+    # "background_pool_size": threshold_generator(0.2, 0.2, 4, 64, 7),
     # Clamped to background_schedule_pool_size internally, so any value is safe
     "background_schedule_pool_initial_size": threshold_generator(0.2, 0.2, 0, 128),
     "background_schedule_pool_max_parallel_tasks_per_type_ratio": threshold_generator(
@@ -163,17 +166,28 @@ possible_properties = {
     "background_streaming_schedule_pool_size": no_zero_threads_lambda,
     "backup_threads": no_zero_threads_lambda,
     "backups_io_thread_pool_queue_size": threshold_generator(0.2, 0.2, 0, 1000),
-    "bcrypt_workfactor": threshold_generator(0.2, 0.2, 0, 20, 31),
+    "bcrypt_workfactor": threshold_generator(0.2, 0.2, 4, 10, 3),
     "cache_size_to_ram_max_ratio": threshold_generator(0.2, 0.2, 0.01, 1.0),
-    # "cannot_allocate_thread_fault_injection_probability": threshold_generator(0.2, 0.2, 0.0, 1.0), the server may not start
+    # "cannot_allocate_thread_fault_injection_probability": threshold_generator(
+    #     0.2, 0.2, 0.0, 0.001
+    # ),
+    "cgroups_memory_usage_observer_wait_time": threshold_generator(
+        0.2, 0.2, 0, 60, allow_unlimited=False
+    ),
     "compiled_expression_cache_elements_size": threshold_generator(0.2, 0.2, 0, 10000),
-    "compiled_expression_cache_size": threshold_generator(0.2, 0.2, 0, 10000),
+    # In bytes (default 128Mi), unlike the element count above
+    "compiled_expression_cache_size": threshold_generator(
+        0.2, 0.2, 0, 512 * 1024 * 1024, 31
+    ),
     "concurrent_threads_lazy_allocation": true_false_lambda,
     "concurrent_threads_scheduler": lambda: random.choice(
         ["round_robin", "fair_round_robin", "max_min_fair"]
     ),
     "concurrent_threads_soft_limit_num": threads_lambda,
     "concurrent_threads_soft_limit_ratio_to_cores": threads_lambda,
+    "config_reload_interval_ms": threshold_generator(
+        0.2, 0.2, 500, 10000, allow_unlimited=False
+    ),
     "cpu_slot_preemption": true_false_lambda,
     "cpu_slot_preemption_timeout_ms": threshold_generator(
         0.2, 0.2, 0, 5000, allow_unlimited=False
@@ -200,6 +214,9 @@ possible_properties = {
     "database_replicated_allow_detach_permanently": true_false_lambda,
     "database_replicated_drop_broken_tables": true_false_lambda,
     "dictionaries_lazy_load": true_false_lambda,
+    "dictionary_background_reconnect_interval": threshold_generator(
+        0.2, 0.2, 100, 10000, allow_unlimited=False
+    ),
     "disable_insertion_and_mutation": true_false_lambda,
     "disable_internal_dns_cache": true_false_lambda,
     "disk_connections_hard_limit": threshold_generator(0.2, 0.2, 0, 400000),
@@ -227,7 +244,7 @@ possible_properties = {
     "dns_cache_update_period": threshold_generator(
         0.2, 0.2, 1, 600, allow_unlimited=False
     ),
-    "dns_max_consecutive_failures": threshold_generator(0.2, 0.2, 1, 10),
+    "dns_max_consecutive_failures": threshold_generator(0.2, 0.2, 1, 10, 4),
     "drop_distributed_cache_pool_size": threads_lambda,
     "drop_distributed_cache_queue_size": threshold_generator(0.2, 0.2, 0, 1000),
     "enable_azure_sdk_logging": true_false_lambda,
@@ -273,6 +290,7 @@ possible_properties = {
     "index_uncompressed_cache_policy": lambda: random.choice(["LRU", "SLRU"]),
     "index_uncompressed_cache_size": threshold_generator(0.2, 0.2, 0, 5368709120),
     "index_uncompressed_cache_size_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
+    "interserver_tables_status_require_auth": true_false_lambda,
     "io_thread_pool_queue_size": threshold_generator(0.2, 0.2, 0, 1000),
     "jemalloc_collect_global_profile_samples_in_trace_log": true_false_lambda,
     "jemalloc_enable_background_threads": true_false_lambda,
@@ -285,17 +303,32 @@ possible_properties = {
         0.2, 0.2, 0, 10000, allow_unlimited=False
     ),
     "jemalloc_max_background_threads_num": threads_lambda,
+    "jemalloc_merge_tree_arenas": threshold_generator(0.2, 0.2, 1, 8, 4),
     # log2 of the sampling interval in bytes (default 19 = 512KiB); keep a floor
     # so the profiler doesn't sample nearly every allocation
     "jemalloc_profiler_sampling_rate": threshold_generator(0.2, 0.2, 10, 32),
+    "keep_alive_timeout": threshold_generator(0.2, 0.2, 1, 60, allow_unlimited=False),
     "keeper_multiread_batch_size": threshold_generator(0.2, 0.2, 1, 1000),
+    # Dolor restarts the keepers, so a short socket timeout is a real target. Not lower
+    # than 5s, or the sessions expire faster than any table can make progress
+    "keeper_server_socket_receive_timeout_sec": threshold_generator(
+        0.2, 0.2, 5, 300, allow_unlimited=False
+    ),
+    "keeper_server_socket_send_timeout_sec": threshold_generator(
+        0.2, 0.2, 5, 300, allow_unlimited=False
+    ),
     "load_marks_threadpool_pool_size": threads_lambda,
     "load_marks_threadpool_queue_size": threshold_generator(0.2, 0.2, 0, 1000),
+    # DiskLocal reads this at the config root, not under the disk
+    "local_disk_check_period_ms": threshold_generator(
+        0.2, 0.2, 0, 60000, allow_unlimited=False
+    ),
     "mark_cache_policy": lambda: random.choice(["LRU", "SLRU"]),
     "mark_cache_prewarm_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
     "mark_cache_size": threshold_generator(0.2, 0.2, 0, 5368709120),
     "mark_cache_size_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
     "max_active_parts_loading_thread_pool_size": threads_lambda,
+    "max_authentication_methods_per_user": threshold_generator(0.2, 0.2, 1, 100, 7),
     "max_backup_bandwidth_for_server": threshold_generator(0.2, 0.2, 0, 100000),
     "max_backups_io_thread_pool_free_size": threshold_generator(0.2, 0.2, 0, 1000),
     "max_backups_io_thread_pool_size": threads_lambda,
@@ -305,8 +338,10 @@ possible_properties = {
     "max_concurrent_select_queries": threshold_generator(0.2, 0.2, 0, 50),
     "max_connections": threshold_generator(0.2, 0.2, 100, 4096, 31),
     "max_database_num_to_throw": threshold_generator(0.2, 0.2, 0, 10),
+    "max_database_num_to_warn": threshold_generator(0.2, 0.2, 1, 10, 4),
     "max_database_replicated_create_table_thread_pool_size": threads_lambda,
     "max_dictionary_num_to_throw": threshold_generator(0.2, 0.2, 0, 10),
+    "max_dictionary_num_to_warn": threshold_generator(0.2, 0.2, 1, 10, 4),
     "max_distributed_cache_read_bandwidth_for_server": threshold_generator(
         0.2, 0.2, 0, 100000
     ),
@@ -327,9 +362,20 @@ possible_properties = {
     "max_merges_bandwidth_for_server": threshold_generator(0.2, 0.2, 0, 100000),
     "max_mutations_bandwidth_for_server": threshold_generator(0.2, 0.2, 0, 100000),
     "max_named_collection_num_to_throw": threshold_generator(0.2, 0.2, 0, 1000),
+    "max_named_collection_num_to_warn": threshold_generator(0.2, 0.2, 1, 1000, 10),
+    "max_open_files": threshold_generator(0.2, 0.2, 0, 100),
     "max_outdated_parts_loading_thread_pool_size": threads_lambda,
-    "max_partition_size_to_drop": threshold_generator(0.2, 0.2, 0, 100000),
+    "max_part_num_to_warn": threshold_generator(0.2, 0.2, 1, 10000, 14),
+    # In bytes, 0 is unlimited. A low value makes every DROP PARTITION of a real partition
+    # fail, which is worth hitting but not on most runs
+    "max_partition_size_to_drop": lambda: random.choice(
+        [0, 0, 0, 0, 1024 * 1024, 50 * 1024 * 1024 * 1024]
+    ),
     "max_parts_cleaning_thread_pool_size": threads_lambda,
+    "max_pending_mutations_execution_time_to_warn": threshold_generator(
+        0.2, 0.2, 1, 86400, 17
+    ),
+    "max_pending_mutations_to_warn": threshold_generator(0.2, 0.2, 1, 500, 9),
     "max_per_cpu_untracked_memory": threshold_generator(0.2, 0.2, 0, 8 * 1024 * 1024),
     "max_prefixes_deserialization_thread_pool_free_size": threshold_generator(
         0.2, 0.2, 0, 1000
@@ -351,19 +397,25 @@ possible_properties = {
     ),
     "max_replicated_table_num_to_throw": threshold_generator(0.2, 0.2, 0, 10),
     # "max_server_memory_usage": threshold_generator(0.2, 0.2, 0, 10),
-    # Floor above 0: with `max_server_memory_usage` unset, a ratio of 0 leaves the total
-    # tracker with a hard limit of 0, which `MemoryTracker` reads as no limit at all, so the
-    # server grows until the kernel kills it instead of answering Code 241.
-    "max_server_memory_usage_to_ram_ratio": threshold_generator(0.2, 0.2, 0.1, 1.0),
+    # Not lower than a quarter: below that the server spends the whole run answering
+    # MEMORY_LIMIT_EXCEEDED. 0 is left out on purpose, it only means "unlimited"
+    "max_server_memory_usage_to_ram_ratio": threshold_generator(0.2, 0.2, 0.25, 1.0),
     "max_snapshot_commit_thread_pool_free_size": threshold_generator(0.2, 0.2, 0, 1000),
     "max_snapshot_commit_thread_pool_size": threads_lambda,
     "max_table_num_to_throw": threshold_generator(0.2, 0.2, 0, 10),
+    "max_table_num_to_warn": threshold_generator(0.2, 0.2, 1, 10, 4),
+    # In bytes, 0 is unlimited, same reasoning as max_partition_size_to_drop
+    "max_table_size_to_drop": lambda: random.choice(
+        [0, 0, 0, 0, 1024 * 1024, 50 * 1024 * 1024 * 1024]
+    ),
     # "max_temporary_data_on_disk_size": threshold_generator(0.2, 0.2, 0, 1000), not worth to mess around
     "max_thread_pool_free_size": threshold_generator(0.2, 0.2, 0, 1000),
     "max_thread_pool_size": threshold_generator(0.2, 0.2, 700, 10000),
     "max_unexpected_parts_loading_thread_pool_size": threads_lambda,
     "max_view_num_to_throw": threshold_generator(0.2, 0.2, 0, 10),
+    "max_view_num_to_warn": threshold_generator(0.2, 0.2, 1, 10, 4),
     "max_waiting_queries": threshold_generator(0.2, 0.2, 0, 100),
+    "max_zookeeper_pooled_connections": threshold_generator(0.2, 0.2, 0, 100, 7),
     "memory_worker_correct_memory_tracker": true_false_lambda,
     "memory_worker_decay_adjustment_period_ms": threshold_generator(
         0.2, 0.2, 0, 30000, allow_unlimited=False
@@ -382,7 +434,11 @@ possible_properties = {
         0.2, 0.2, 0.0, 1.0
     ),
     "memory_worker_use_cgroup": true_false_lambda,
-    "merges_mutations_memory_usage_soft_limit": threshold_generator(0.2, 0.2, 0, 1000),
+    # In bytes, 0 is unlimited. Under a few hundred Mi no background merge or mutation is
+    # ever scheduled, so the range has to be at RAM scale and not a plain count
+    "merges_mutations_memory_usage_soft_limit": threshold_generator(
+        0.2, 0.2, 0, 8 * 1024 * 1024 * 1024, 31
+    ),
     "merges_mutations_memory_usage_to_ram_ratio": threshold_generator(
         0.2, 0.2, 0.0, 1.0
     ),
@@ -410,11 +466,11 @@ possible_properties = {
     "oom_canary_size": threshold_generator(0.2, 0.2, 0, 104857600, 27),
     "os_collect_psi_metrics": true_false_lambda,
     "os_threads_nice_value_distributed_cache_tcp_handler": threshold_generator(
-        0.2, 0.2, -20, 19
+        0.2, 0.2, -20, 19, 4
     ),
-    "os_threads_nice_value_merge_mutate": threshold_generator(0.2, 0.2, -20, 19),
+    "os_threads_nice_value_merge_mutate": threshold_generator(0.2, 0.2, -20, 19, 4),
     "os_threads_nice_value_zookeeper_client_send_receive": threshold_generator(
-        0.2, 0.2, -20, 19
+        0.2, 0.2, -20, 19, 4
     ),
     "page_cache_free_memory_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
     "page_cache_history_window_ms": threshold_generator(
@@ -463,6 +519,7 @@ possible_properties = {
     "primary_index_cache_size": threshold_generator(0.2, 0.2, 0, 5368709120),
     "primary_index_cache_size_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
     "process_query_plan_packet": true_false_lambda,
+    "prometheus_keeper_metrics_only": true_false_lambda,
     "query_cache": {
         "max_entries": threshold_generator(0.2, 0.2, 0, 1024),
         "max_entry_size_in_bytes": threshold_generator(0.2, 0.2, 0, 10 * 1024 * 1024),
@@ -477,13 +534,26 @@ possible_properties = {
     "query_condition_cache_size": threshold_generator(0.2, 0.2, 0, 104857600),
     "query_condition_cache_size_ratio": threshold_generator(0.2, 0.2, 0.0, 1.0),
     "remap_executable": true_false_lambda,
+    # 0 falls back to the generic HTTP timeouts; small values exercise the fetch retries
+    "replicated_fetches_http_connection_timeout": threshold_generator(
+        0.2, 0.2, 0, 30, allow_unlimited=False
+    ),
+    "replicated_fetches_http_receive_timeout": threshold_generator(
+        0.2, 0.2, 0, 30, allow_unlimited=False
+    ),
+    "replicated_fetches_http_send_timeout": threshold_generator(
+        0.2, 0.2, 0, 30, allow_unlimited=False
+    ),
     "restore_threads": no_zero_threads_lambda,
     "s3_allow_server_credentials_for_system_table_disks": true_false_lambda,
     "s3_credentials_provider_max_cache_size": threshold_generator(
         0.2, 0.2, 0, 104857600
     ),
     "s3_load_table_anonymously_if_credentials_restricted": true_false_lambda,
+    "s3_max_redirects": threshold_generator(0.2, 0.2, 0, 20, 5),
+    "s3_retry_attempts": threshold_generator(0.2, 0.2, 1, 20, 5),
     "s3queue_disable_streaming": true_false_lambda,
+    "show_addresses_in_stack_traces": true_false_lambda,
     "show_license_expiration_warnings": true_false_lambda,  # Cloud setting
     "shutdown_wait_backups_and_restores": true_false_lambda,
     "shutdown_wait_unfinished": threshold_generator(
@@ -538,7 +608,9 @@ possible_properties = {
         0.2, 0.2, 0, 1024 * 1024
     ),
     "total_memory_profiler_step": threshold_generator(0.2, 0.2, 0, 4 * 1024 * 1024),
-    "total_memory_tracker_sample_probability": threshold_generator(0.2, 0.2, 0.0, 1.0),
+    # Capped: near 1.0, paired with a small total_memory_profiler_step, this writes a
+    # stack trace per allocation and the server crawls
+    "total_memory_tracker_sample_probability": threshold_generator(0.2, 0.2, 0.0, 0.01),
     "transaction_log": {
         "fault_probability_after_commit": threshold_generator(0.2, 0.2, 0.0, 1.0),
         "fault_probability_before_commit": threshold_generator(0.2, 0.2, 0.0, 1.0),
@@ -598,27 +670,52 @@ object_storages_properties = {
             0.2, 0.2, 0, 10 * 1024 * 1024, 32
         ),
         "remove_shared_recursive_file_limit": threshold_generator(0.2, 0.2, 0, 31),
+        "s3_allow_multipart_copy": true_false_lambda,
         "s3_allow_native_copy": true_false_lambda,
         "s3_check_objects_after_upload": true_false_lambda,
+        "s3_enable_request_logging": true_false_lambda,
         "s3_max_get_burst": threshold_generator(0.2, 0.2, 0, 100),
         "s3_max_get_rps": threshold_generator(0.2, 0.2, 0, 100),
         "s3_max_inflight_parts_for_one_file": threshold_generator(0.2, 0.2, 0, 16),
+        # validateUploadSettings rejects 0
+        "s3_max_part_number": threshold_generator(0.2, 0.2, 10, 10000, 14),
         "s3_max_put_burst": threshold_generator(0.2, 0.2, 0, 100),
         "s3_max_put_rps": threshold_generator(0.2, 0.2, 0, 100),
+        "s3_max_single_operation_copy_size": threshold_generator(
+            0.2, 0.2, 0, 5 * 1024 * 1024 * 1024, 32
+        ),
         "s3_max_single_part_upload_size": threshold_generator(
             0.2, 0.2, 0, 10 * 1024 * 1024
         ),
         "s3_max_single_read_retries": threshold_generator(0.2, 0.2, 1, 16),
         "s3_max_unexpected_write_error_retries": threshold_generator(0.2, 0.2, 1, 16),
+        # bits=32 so the huge branch stays under the 5Gi S3 part limit
         "s3_max_upload_part_size": threshold_generator(
-            0.2, 0.2, 16 * 1024 * 1024, 5 * 1024 * 1024 * 1024, 33
+            0.2, 0.2, 16 * 1024 * 1024, 5 * 1024 * 1024 * 1024, 32
         ),
+        # Never above the lower bound of s3_max_upload_part_size: validateUploadSettings
+        # rejects min > max, and rejects a zero min
+        "s3_min_upload_part_size": threshold_generator(
+            0.2, 0.2, 1024, 16 * 1024 * 1024, 24
+        ),
+        "s3_request_timeout_ms": threshold_generator(
+            0.2, 0.2, 1000, 60000, allow_unlimited=False
+        ),
+        "s3_retry_attempts": threshold_generator(0.2, 0.2, 1, 20, 5),
+        # Kept under the lower bound of s3_retry_max_delay_ms
+        "s3_retry_initial_delay_ms": threshold_generator(
+            0.2, 0.2, 1, 500, allow_unlimited=False
+        ),
+        "s3_retry_max_delay_ms": threshold_generator(
+            0.2, 0.2, 1000, 10000, allow_unlimited=False
+        ),
+        "s3_slow_all_threads_after_network_error": true_false_lambda,
         "s3_strict_upload_part_size": threshold_generator(
             0.2, 0.2, 0, 100 * 1024 * 1024
         ),
         "s3_upload_part_size_multiply_factor": threshold_generator(0.2, 0.2, 1, 10, 4),
         "s3_upload_part_size_multiply_parts_count_threshold": threshold_generator(
-            0.2, 0.2, 1, 1000
+            0.2, 0.2, 1, 1000, 10
         ),
         # "server_side_encryption_customer_key_base64": true_false_lambda, not working well
         # "skip_access_check": true_false_lambda, may break the startup
@@ -648,7 +745,8 @@ object_storages_properties = {
             0.2, 0.2, 0, 10 * 1024 * 1024
         ),
         "min_upload_part_size": threshold_generator(0.2, 0.2, 1, 10 * 1024 * 1024),
-        "objects_chunk_size_to_delete": threshold_generator(
+        # `objects_chunk_size_to_delete` is read only by S3Settings, so it is left out here
+        "object_metadata_cache_size": threshold_generator(
             0.2, 0.2, 0, 10 * 1024 * 1024
         ),
         "remove_shared_recursive_file_limit": threshold_generator(0.2, 0.2, 0, 31),
@@ -699,8 +797,10 @@ cache_storage_properties = {
     "background_download_threads": threads_lambda,
     "boundary_alignment": threshold_generator(0.2, 0.2, 1, 128, bits=7),
     "bypass_cache_threshold": threshold_generator(0.2, 0.2, 0, 1024 * 1024 * 1024),
+    "cache_hits_threshold": threshold_generator(0.2, 0.2, 0, 10, 4),
     "cache_on_write_operations": true_false_lambda,
     "check_cache_probability": threshold_generator(0.2, 0.2, 0.0, 1.0),
+    "drop_cache_threads": no_zero_threads_lambda,
     "dynamic_resize_lock_wait_ms": threshold_generator(
         0.2, 0.2, 0, 5000, allow_unlimited=False
     ),
@@ -708,6 +808,13 @@ cache_storage_properties = {
     "enable_filesystem_query_cache_limit": true_false_lambda,
     "expose_prometheus_eviction_metrics": true_false_lambda,
     "expose_prometheus_eviction_metrics_per_user": true_false_lambda,
+    "idle_client_check_interval_sec": threshold_generator(
+        0.2, 0.2, 0, 3600, allow_unlimited=False
+    ),
+    "idle_client_eviction_threads": no_zero_threads_lambda,
+    "idle_client_ttl_sec": threshold_generator(
+        0.2, 0.2, 1, 7 * 24 * 60 * 60, allow_unlimited=False
+    ),
     "invalidated_entries_cleanup_interval_ms": threshold_generator(
         0.2, 0.2, 1, 60000, allow_unlimited=False
     ),
@@ -755,9 +862,6 @@ policy_properties = {
 all_disks_properties = {
     "description": lambda: generate_xml_safe_string(random.randint(1, 1024)),
     "keep_free_space_bytes": threshold_generator(0.2, 0.2, 0, 10 * 1024 * 1024),
-    "local_disk_check_period_ms": threshold_generator(
-        0.2, 0.2, 0, 60000, allow_unlimited=False
-    ),
     "min_bytes_for_seek": threshold_generator(0.2, 0.2, 0, 10 * 1024 * 1024),
     "perform_ttl_move_on_insert": true_false_lambda,
     "readonly": lambda: 1 if random.randint(0, 9) < 2 else 0,
@@ -769,8 +873,27 @@ all_disks_properties = {
 backup_properties = {
     "allow_concurrent_backups": true_false_lambda,
     "allow_concurrent_restores": true_false_lambda,
+    "attempts_to_collect_metadata_before_sleep": threshold_generator(
+        0.2, 0.2, 1, 10, 4
+    ),
+    "collect_metadata_timeout": threshold_generator(
+        0.2, 0.2, 1000, 600000, allow_unlimited=False
+    ),
     "compare_collected_metadata": true_false_lambda,
+    "create_table_timeout": threshold_generator(
+        0.2, 0.2, 1000, 300000, allow_unlimited=False
+    ),
+    "data_file_name_prefix_length": threshold_generator(0.2, 0.2, 0, 8, 3),
+    "max_attempts_after_bad_version": threshold_generator(0.2, 0.2, 1, 100, 7),
+    # Kept above the upper bound of the min sleep below
+    "max_sleep_before_next_attempt_to_collect_metadata": threshold_generator(
+        0.2, 0.2, 1000, 10000, 14
+    ),
+    "min_sleep_before_next_attempt_to_collect_metadata": threshold_generator(
+        0.2, 0.2, 1, 500, 9
+    ),
     "remove_backup_files_after_failure": true_false_lambda,
+    "sync_period_ms": threshold_generator(0.2, 0.2, 1000, 60000, allow_unlimited=False),
     "test_inject_sleep": true_false_lambda,
     "test_randomize_order": true_false_lambda,
 }
@@ -1974,11 +2097,18 @@ keeper_settings = {
         "async_replication": true_false_lambda,
         "auto_forwarding": true_false_lambda,
         "check_node_acl_on_remove": true_false_lambda,
+        "commit_logs_cache_entry_count_threshold": threshold_generator(
+            0.2, 0.2, 0, 100000, 17
+        ),
         "commit_logs_cache_size_threshold": threshold_generator(
             0.2, 0.2, 0, 1000 * 1024 * 1024
         ),
         "commit_profiler_real_time_period_ns": threshold_generator(
             0.2, 0.2, 0, 1000000000, allow_unlimited=False
+        ),
+        # The keeper LSM storage. Floors keep it from flushing and merging non-stop
+        "committed_memtable_size": threshold_generator(
+            0.2, 0.2, 4 * 1024 * 1024, 256 * 1024 * 1024, 28
         ),
         "compress_logs": true_false_lambda,
         "compress_snapshots_with_zstd_format": true_false_lambda,
@@ -1990,13 +2120,21 @@ keeper_settings = {
         "disk_move_retries_wait_ms": threshold_generator(
             0.2, 0.2, 0, 5000, allow_unlimited=False
         ),
+        "dispatch_busy_wait_long_sleep_us": threshold_generator(
+            0.2, 0.2, 0, 100000, allow_unlimited=False
+        ),
         "dispatch_busy_wait_sleep_us": threshold_generator(
             0.2, 0.2, 0, 10000, allow_unlimited=False
         ),
+        "file_block_size": threshold_generator(0.2, 0.2, 4096, 262144, 18),
+        "flush_threads": threshold_generator(0.2, 0.2, 1, 8, 3),
         "force_sync": true_false_lambda,
         "fresh_log_gap": threshold_generator(0.2, 0.2, 0, 200),
         "heart_beat_interval_ms": threshold_generator(
             0.2, 0.2, 100, 1500, allow_unlimited=False
+        ),
+        "latest_logs_cache_entry_count_threshold": threshold_generator(
+            0.2, 0.2, 0, 200000, 18
         ),
         "latest_logs_cache_size_threshold": threshold_generator(
             0.2, 0.2, 0, 2 * 1024 * 1024 * 1024
@@ -2012,6 +2150,15 @@ keeper_settings = {
             0.2, 0.2, 0, 1000 * 1024 * 1024
         ),
         "log_readahead_enabled": true_false_lambda,
+        # NonZeroUInt64. `log_readahead_pool_threads` is left at its 0 (auto) default:
+        # Changelog rejects a non-zero pool smaller than the peer reader count
+        "log_readahead_eviction_timeout_ms": threshold_generator(
+            0.2, 0.2, 1000, 60000, allow_unlimited=False
+        ),
+        "log_readahead_max_peer_readers": threshold_generator(0.2, 0.2, 1, 8, 3),
+        "log_readahead_serve_wait_timeout_ms": threshold_generator(
+            0.2, 0.2, 1, 1000, allow_unlimited=False
+        ),
         "log_readahead_window_bytes": threshold_generator(
             0.2, 0.2, 1, 64 * 1024 * 1024
         ),
@@ -2024,6 +2171,8 @@ keeper_settings = {
         "log_slow_total_threshold_ms": threshold_generator(
             0.2, 0.2, 0, 30000, allow_unlimited=False
         ),
+        # Always above the upper bound of min_files_to_merge
+        "max_files_to_merge": threshold_generator(0.2, 0.2, 20, 100, 7),
         "max_flush_batch_size": threshold_generator(0.2, 0.2, 0, 2000),
         "max_in_flight_request_batches": threshold_generator(0.2, 0.2, 1, 100),
         "max_log_file_size": threshold_generator(0.2, 0.2, 0, 100 * 1024 * 1024),
@@ -2048,6 +2197,10 @@ keeper_settings = {
         "max_response_queue_bytes_size": threshold_generator(
             0.2, 0.2, 0, 100 * 1024 * 1024
         ),
+        "max_size_ratio": threshold_generator(0.2, 0.2, 0.1, 0.95),
+        "memtable_block_size": threshold_generator(0.2, 0.2, 4096, 262144, 18),
+        "merge_threads": threshold_generator(0.2, 0.2, 1, 8, 3),
+        "min_files_to_merge": threshold_generator(0.2, 0.2, 2, 10, 4),
         "min_request_size_for_cache": threshold_generator(0.2, 0.2, 0, 100 * 1024),
         # Must stay under `session_timeout_ms`, the max of the same pair, pinned to 15000
         # (60000 under sanitizers) below - which only holds without the `2**bits - 1` draw.
@@ -2090,6 +2243,10 @@ keeper_settings = {
             0.2, 0.2, 0, 16 * 1024 * 1024
         ),
         "snapshots_to_keep": threshold_generator(0.2, 0.2, 0, 5),
+        "sorted_file_uncompressed_size": threshold_generator(
+            0.2, 0.2, 4 * 1024 * 1024, 128 * 1024 * 1024, 27
+        ),
+        "sorted_runs_soft_limit": threshold_generator(0.2, 0.2, 4, 200, 8),
         "stale_log_gap": threshold_generator(0.2, 0.2, 0, 10000),
         "startup_timeout": threshold_generator(
             0.2, 0.2, 1000, 600000, allow_unlimited=False
@@ -2111,11 +2268,23 @@ keeper_settings = {
         "ttl_gc_period_ms": threshold_generator(
             0.2, 0.2, 1, 10000, allow_unlimited=False
         ),
+        "uncommitted_memtable_size": threshold_generator(
+            0.2, 0.2, 1024 * 1024, 64 * 1024 * 1024, 26
+        ),
+        "unflushed_memtables_soft_limit": threshold_generator(0.2, 0.2, 1, 16, 4),
         "use_new_dispatcher": true_false_lambda,
         "storage_memory_only": true_false_lambda,
         "use_lsmt_storage": true_false_lambda,
         "use_xid_64": true_false_lambda,
         "write_snapshot_version": lambda: random.choice([6, 7, 8, 9]),
+        "write_throttling_factor": threshold_generator(0.2, 0.2, 1.0, 64.0),
+        # Always above the upper bound of the min delay below
+        "write_throttling_max_delay_us": threshold_generator(
+            0.2, 0.2, 100000, 5000000, allow_unlimited=False
+        ),
+        "write_throttling_min_delay_us": threshold_generator(
+            0.2, 0.2, 1000, 10000, allow_unlimited=False
+        ),
     },
     "create_snapshot_on_exit": true_false_lambda,
     "digest_enabled": true_false_lambda,
