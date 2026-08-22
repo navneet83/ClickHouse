@@ -137,9 +137,9 @@ def _fuzzer_log_terminal_block_has_server_mle(fuzzer_log: Path) -> bool:
 
 
 # BUZZHOUSE_ORACLE in Common/ErrorCodes.cpp. main() returns the error code but the OS
-# keeps only its low byte, so 1014 reaches the job as exit 243. Oracle findings use their
+# keeps only its low byte, so 1015 reaches the job as exit 243. Oracle findings use their
 # own code precisely so they are never confused with a BUZZHOUSE (739) config error.
-BUZZHOUSE_ORACLE_ERROR_CODE = 1014
+BUZZHOUSE_ORACLE_ERROR_CODE = 1015
 BUZZHOUSE_ORACLE_EXIT_CODE = BUZZHOUSE_ORACLE_ERROR_CODE & 0xFF
 
 # Genuine (non-OOM) failure signals that veto the OOM-is-success downgrade, so a real
@@ -381,7 +381,7 @@ def analyze_job_logs(
     is_failed = True
     # A wrong-result finding, not a crash: it must skip the OOM checks and the crash log
     # parser below. The exit code alone cannot prove one - it is truncated to 8 bits, so
-    # 243, 499 and 755 all look like BUZZHOUSE_ORACLE (1014) - hence the log marker too.
+    # 243, 499 and 755 all look like BUZZHOUSE_ORACLE (1015) - hence the log marker too.
     # Only the tail: BuzzHouse exits on the oracle error, so the one that ended the run is
     # at the end of the log, and an older match is from a step that already finished.
     oracle_error = (
