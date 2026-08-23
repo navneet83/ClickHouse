@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -670,6 +671,7 @@ def run_fuzz_job(check_name: str):
 
     docker_image = DockerImage.get_docker_image(IMAGE_NAME).pull_image()
 
+    shutil.rmtree(WORKSPACE_PATH, ignore_errors=True)
     WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
 
     info = Info()

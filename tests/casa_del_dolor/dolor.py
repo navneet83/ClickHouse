@@ -786,6 +786,86 @@ while all_running and (not reached_limit):
     if all_running:
         tables_oracle.collect_table_hash_after_shutdown(cluster, logger, dump_table)
 
+
+# Frames of the shutdown thread copied into dolor.log. Enough to name the stage of shutdown
+# that did not finish; the whole dump of every thread stays in the gdb.log artifact.
+FORCED_STOP_BACKTRACE_FRAMES = 60
+
+
+# Attempts to stop Distributed sends before a shutdown, as the stress suite does.
+DISTRIBUTED_SENDS_STOP_ATTEMPTS = 30
+DISTRIBUTED_SENDS_STOP_TIMEOUT = 10
+
+
+def stop_distributed_sends(server) -> None:
+    """Ask a server to stop Distributed sends before shutting it down.
+
+    The same workaround the stress suite applies in `stop_server` (tests/docker_scripts/
+    stress_tests.lib): Distributed tables are shut down sequentially, so a send already in
+    flight can hold the whole shutdown past its window and get the server force killed.
+    Refs: https://github.com/ClickHouse/ClickHouse/issues/72557
+    """
+    last_error = None
+    for _ in range(DISTRIBUTED_SENDS_STOP_ATTEMPTS):
+        try:
+            server.query(
+                "SYSTEM STOP DISTRIBUTED SENDS", timeout=DISTRIBUTED_SENDS_STOP_TIMEOUT
+            )
+            return
+        except Exception as ex:
+            last_error = ex
+            if server.get_process_pid("clickhouse") is None:
+                return  # already gone, nothing left to ask
+    logging.warning(f"Could not stop Distributed sends on {server.name}: {last_error}")
+
+
+def _compact_frame(line: str, width: int = 200) -> str:
+    """A gdb frame is mostly template spew. Keep its head and the `at file:line` tail, which
+    is the part that says where the thread actually is. `width` bounds the head only - the
+    tail is kept whole on top of it, being the point of the exercise."""
+    if len(line) <= width:
+        return line
+    tail = re.search(r" at [^ ]+:\d+$", line)
+    head = line[: width - 40].rstrip()
+    return f"{head} ... {tail.group(0).strip()}" if tail else f"{head} ..."
+
+
+def log_server_backtrace(server) -> None:
+    """Copy the backtrace of a server's main thread into dolor.log.
+
+    Called from the paths that give up on a server: a force kill after a graceful stop
+    timed out, and a stop that returned with the process still running.
+
+    `stop_clickhouse` already runs `thread apply all bt` into the container's gdb.log before
+    escalating to SIGKILL, but nothing points at it, so a forced stop reads as a dead end in
+    the report. The main thread is the one running the shutdown, so it names the stage that
+    did not finish - a wait on connections, a storage teardown, and so on.
+    """
+    dump = pathlib.Path(server.path) / "logs" / "gdb.log"
+    try:
+        text = dump.read_text(encoding="utf-8", errors="replace")
+    except OSError as ex:
+        logging.warning(
+            f"Could not read the backtrace of {server.name} from {dump}: {ex}"
+        )
+        return
+    # gdb.log accumulates one dump per force kill, so take the last; within it the threads
+    # are printed in order and gdb numbers the process main thread 1.
+    matches = re.findall(r"^Thread 1 \(.*?(?=^Thread \d+ \(|\Z)", text, re.M | re.S)
+    if not matches:
+        logging.warning(f"No gdb backtrace found in {dump} for {server.name}")
+        return
+    frames = [_compact_frame(line) for line in matches[-1].splitlines()]
+    dropped = len(frames) - FORCED_STOP_BACKTRACE_FRAMES
+    body = "\n".join(frames[:FORCED_STOP_BACKTRACE_FRAMES])
+    if dropped > 0:
+        body += f"\n  ... {dropped} more frames, see gdb.log"
+    logging.error(
+        f"Main thread of {server.name} when it was force killed "
+        f"(every thread is in its gdb.log artifact):\n{body}"
+    )
+
+
 good_exit = True
 
 # Check load generator first. The codes `validate_exit_code` accepts only mean "as expected"
@@ -817,11 +897,16 @@ for server in servers:
             )
             good_exit = False
     else:
+        stop_distributed_sends(server)
         server.stop_clickhouse(stop_wait_sec=SERVER_STOP_WAIT_SECONDS, kill=False)
         if server.get_process_pid("clickhouse") is not None:
             logger.warning(
                 f"Instance {server.name} is still running after stop command"
             )
+            # `stop_clickhouse` swallowed something and never reached its own force kill,
+            # so nothing has dumped this server yet and it is still alive to be dumped.
+            if server.dump_backtrace("still running after stop"):
+                log_server_backtrace(server)
             good_exit = False
     exit_code = None
     if server.clickhouse_exec_id:
@@ -836,7 +921,8 @@ for server in servers:
             exit_code = server.clickhouse_last_exit_code
             if exit_code is None:
                 logging.error(
-                    f"Could not inspect exec for {server.name} and no exit code was recorded: {ex}"
+                    f"Exit code unaccounted for: could not inspect the exec for "
+                    f"{server.name} and none was recorded: {ex}"
                 )
                 good_exit = False
             else:
@@ -852,7 +938,8 @@ for server in servers:
             # recorded; without one an abort during shutdown would go unnoticed. The
             # `pid is None` case is already reported above.
             logging.error(
-                f"Server {server.name} stopped without recording an exit code"
+                f"Exit code unaccounted for: server {server.name} stopped "
+                "without recording one"
             )
             good_exit = False
     if exit_code is not None:
@@ -871,6 +958,7 @@ for server in servers:
         logging.error(
             f"Server {server.name} did not shut down gracefully and had to be force killed"
         )
+        log_server_backtrace(server)
         good_exit = False
     if grep_server_logs(server, "Logical error:"):
         logging.error(f"Logical error in instance '{server.name}'")

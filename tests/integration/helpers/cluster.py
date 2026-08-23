@@ -142,6 +142,24 @@ CLICKHOUSE_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.log"
 
 CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.log"
 
+CLICKHOUSE_GDB_LOG_FILE = "/var/log/clickhouse-server/gdb.log"
+
+# The stress suite gives the same dump `timeout 30m` (tests/docker_scripts/stress_tests.lib),
+# but it takes one at the very end of a run. This one runs on every give-up, including the
+# restarts in the middle of a run, so a stall here holds up everything after it. Five minutes
+# is far above the observed cost of dumping an 800-thread sanitizer build.
+GDB_BACKTRACE_TIMEOUT_SECONDS = 300
+
+# Graceful-stop window for builds that are simply slow rather than stuck: LLVM coverage
+# and the sanitizers. Only ever reached when a stop is not finishing, so a healthy test
+# never pays it.
+SLOW_BUILD_STOP_WAIT_SECONDS = 180
+
+# A sanitizer report still being symbolized would be truncated by a force kill, so the kill
+# waits for `llvm-symbolizer` to finish. Bounded, because waiting forever to diagnose a hang
+# just moves the hang.
+SYMBOLIZER_WAIT_SECONDS = 600
+
 # Minimum version we use in integration tests to check compatibility with old releases
 # Keep in mind that we only support upgrading between releases that are at most 1 year different.
 # This means that this minimum need to be, at least, 1 year older than the current release
@@ -5519,6 +5537,45 @@ class ClickHouseInstance:
         except Exception as e:
             logging.warning(f"Could not inspect exec of {self.name}: {e}")
 
+    def wait_for_symbolizer(self, wait_sec=SYMBOLIZER_WAIT_SECONDS):
+        """Let an in-flight sanitizer report finish symbolizing before killing the server."""
+        deadline = time.time() + wait_sec
+        while self.get_process_pid("llvm-symbolizer") is not None:
+            if time.time() > deadline:
+                logging.warning(
+                    f"llvm-symbolizer still running after {wait_sec}s on {self.name}, "
+                    "the sanitizer report may be truncated"
+                )
+                return
+            time.sleep(1)
+
+    def dump_backtrace(self, occasion: str) -> bool:
+        """Append `thread apply all backtrace` of the running server to gdb.log.
+
+        Same shape as the stress suite's `stop_server` (tests/docker_scripts/
+        stress_tests.lib): one dedicated file, appended, each dump headed by whatever
+        prompted it and when, so a run that gives up on a server more than once keeps them
+        all and they can be lined up against the run log. Returns False when there is no
+        process left to dump.
+        """
+        pid = self.get_process_pid("clickhouse")
+        if pid is None:
+            return False
+        self.exec_in_container(
+            [
+                "bash",
+                "-c",
+                f'echo "thread apply all backtrace ({occasion}) at $(date -u +%FT%TZ)"'
+                f" >> {CLICKHOUSE_GDB_LOG_FILE}; "
+                f"timeout {GDB_BACKTRACE_TIMEOUT_SECONDS}"
+                f" gdb -batch -ex 'thread apply all bt' -p {pid}"
+                f" >> {CLICKHOUSE_GDB_LOG_FILE} 2>&1",
+            ],
+            user="root",
+            nothrow=True,
+        )
+        return True
+
     def stop_clickhouse(self, stop_wait_sec=30, kill=False):
         if not self.stay_alive:
             raise Exception(
@@ -5543,15 +5600,22 @@ class ClickHouseInstance:
             # which is reliable - unlike LLVM_PROFILE_FILE, which is set for every
             # container regardless of build. restart_clickhouse() delegates here, so it
             # is covered too.
-            if not kill and stop_wait_sec < 180:
-                if getattr(self, "_built_with_llvm_coverage", None) is None:
+            # A sanitizer build needs the same allowance for a different reason: teardown
+            # destroys every MergeTree part with each read instrumented, so a server holding
+            # a lot of parts can still be making steady progress when a short window runs
+            # out, and gets force killed as though it had deadlocked.
+            if not kill and stop_wait_sec < SLOW_BUILD_STOP_WAIT_SECONDS:
+                if getattr(self, "_is_slow_build", None) is None:
                     try:
-                        self._built_with_llvm_coverage = self.is_built_with_llvm_coverage()
+                        self._is_slow_build = (
+                            self.is_built_with_llvm_coverage()
+                            or self.is_built_with_sanitizer()
+                        )
                     except Exception as e:
-                        logging.warning(f"Could not detect LLVM coverage build: {e}")
-                        self._built_with_llvm_coverage = False
-                if self._built_with_llvm_coverage:
-                    stop_wait_sec = 180
+                        logging.warning(f"Could not detect a slow build: {e}")
+                        self._is_slow_build = False
+                if self._is_slow_build:
+                    stop_wait_sec = SLOW_BUILD_STOP_WAIT_SECONDS
 
             self.exec_in_container(
                 ["bash", "-c", "pkill {} clickhouse".format("-9" if kill else "-15")],
@@ -5569,22 +5633,17 @@ class ClickHouseInstance:
                     time.sleep(1)
 
             # Some sanitizer report in progress?
-            while self.get_process_pid("llvm-symbolizer") is not None:
-                time.sleep(1)
+            self.wait_for_symbolizer()
 
             pid = self.get_process_pid("clickhouse")
             if pid is not None:
                 logging.warning(
                     f"Force kill clickhouse in stop_clickhouse. ps:{pid}"
                 )
-                self.exec_in_container(
-                    [
-                        "bash",
-                        "-c",
-                        f"gdb -batch -ex 'thread apply all bt' -p {pid} > /var/log/clickhouse-server/stdout.log",
-                    ],
-                    user="root",
-                )
+                # This used to redirect `>` over stdout.log, which destroyed the server's
+                # own stdout - where a sanitizer report lands - and left only the last
+                # backtrace of a run that force-kills more than once.
+                self.dump_backtrace("on stop")
                 # Escalation only: a caller that asked for kill=True directly wanted a
                 # hard stop, but reaching here means a graceful stop timed out.
                 self.clickhouse_forced_stop = True
@@ -5665,6 +5724,10 @@ class ClickHouseInstance:
                     logging.warning(
                         f"Current start attempt failed. Will kill {pid} just in case."
                     )
+                    # `wait_start` already dumped this process to gdb.log on its way out,
+                    # so only give a sanitizer report in flight time to finish: the kill
+                    # below would truncate it.
+                    self.wait_for_symbolizer()
                     self.exec_in_container(
                         ["bash", "-c", f"kill -9 {pid}"], user="root", nothrow=True
                     )
@@ -5707,12 +5770,7 @@ class ClickHouseInstance:
             ["bash", "-c", "ps -C clickhouse"], nothrow=True, user="root"
         )
         logging.info(f"PS RESULT:\n{ps_clickhouse}")
-        pid = self.get_process_pid("clickhouse")
-        if pid is not None:
-            self.exec_in_container(
-                ["bash", "-c", f"gdb -batch -ex 'thread apply all bt' -p {pid}"],
-                user="root",
-            )
+        self.dump_backtrace("on start timeout")
         if last_err is not None:
             raise last_err
 
@@ -5730,12 +5788,7 @@ class ClickHouseInstance:
             ["bash", "-c", "ps -C clickhouse"], nothrow=True, user="root"
         )
         logging.info(f"PS RESULT:\n{ps_clickhouse}")
-        pid = self.get_process_pid("clickhouse")
-        if pid is not None:
-            self.exec_in_container(
-                ["bash", "-c", f"gdb -batch -ex 'thread apply all bt' -p {pid}"],
-                user="root",
-            )
+        self.dump_backtrace("on shutdown timeout")
         raise Exception(
             "ClickHouse server is still running, but was expected to shutdown. Check logs."
         )

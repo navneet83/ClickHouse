@@ -45,6 +45,11 @@ FORCED_STOP_MESSAGE = "did not shut down gracefully and had to be force killed"
 # never reaches the force-kill above and logs no message of its own (its broad `except` does
 # this). `dolor.py` fails the run on it, and it leaves no exit code to collapse either.
 STOP_FAILED_MESSAGE = "is still running after stop command"
+# Shared prefix of the two exit-bookkeeping failures in `dolor.py`: the exec could not be
+# inspected and no code was recorded, or a server stopped without recording one. Neither
+# leaves any other trace in the log, so without this marker they are `good_exit = False`
+# reasons the wrapper cannot see, and a benign OOM in the same run would pass them off.
+EXIT_UNACCOUNTED_MESSAGE = "Exit code unaccounted for"
 
 
 def collapse_server_exit_code(
@@ -154,6 +159,11 @@ def _dolor_instances_dir() -> str:
     return f"{repo_dir}/tests/casa_del_dolor/{get_instances_dir('dolor')}"
 
 
+# Node logs a healthy run never produces, so their absence is not worth a warning.
+# `gdb.log` is only written when `stop_clickhouse` had to force kill a hung server.
+OPTIONAL_NODE_LOGS = frozenset({"gdb.log"})
+
+
 def get_node_container_logs(node_index: int):
     instances_dir = _dolor_instances_dir()
     return [
@@ -165,6 +175,8 @@ def get_node_container_logs(node_index: int):
         Path(f"{instances_dir}/node{node_index}/logs/stdout.log"),
         # ClickHouse server stderr log file
         Path(f"{instances_dir}/node{node_index}/logs/stderr.log"),
+        # Backtraces taken by `stop_clickhouse` before it force killed a hung server
+        Path(f"{instances_dir}/node{node_index}/logs/gdb.log"),
     ]
 
 
@@ -178,6 +190,8 @@ def get_node_workspace_logs(workspace_path: Path, node_index: int):
         workspace_path / f"stdout{node_index}.log",
         # ClickHouse server stderr log file
         workspace_path / f"stderr{node_index}.log",
+        # Backtraces taken by `stop_clickhouse` before it force killed a hung server
+        workspace_path / f"gdb{node_index}.log",
     ]
 
 
@@ -299,7 +313,10 @@ def _is_expected_kill_only_failure(result: Result) -> bool:
 
 
 def _has_specific_failure_verdict(
-    forced_stop: bool, stop_failed: bool, generator_early_exit_code: int | None
+    forced_stop: bool,
+    stop_failed: bool,
+    generator_early_exit_code: int | None,
+    exit_unaccounted: bool = False,
 ) -> bool:
     """True when `_classify_failed_run` is guaranteed to name the failure itself.
 
@@ -307,7 +324,12 @@ def _has_specific_failure_verdict(
     these produces a named failure there, so a nameless verdict is never traded for a vaguer
     one - or for no verdict at all.
     """
-    return forced_stop or stop_failed or generator_early_exit_code is not None
+    return (
+        forced_stop
+        or stop_failed
+        or generator_early_exit_code is not None
+        or exit_unaccounted
+    )
 
 
 def _classify_failed_run(
@@ -318,6 +340,7 @@ def _classify_failed_run(
     forced_stop: bool = False,
     stop_failed: bool = False,
     generator_early_exit_code: int | None = None,
+    exit_unaccounted: bool = False,
 ) -> tuple[Result | None, str | None]:
     """Decide what a non-zero `dolor.py` exit means when `analyze_job_logs` returned OK.
 
@@ -392,6 +415,22 @@ def _classify_failed_run(
             results=[
                 Result(
                     name="Load generator",
+                    info=f"{message}. Check fuzzer.log.",
+                    status=Result.Status.FAIL,
+                )
+            ],
+            info=message,
+            stopwatch=sw,
+        )
+    # `dolor.py` could not account for how a server exited. That is a teardown failure of its
+    # own and no OOM elsewhere explains it, so like the cases above it overrides
+    # `benign_downgrade` rather than being passed off by it.
+    if failed_result is None and exit_unaccounted:
+        message = "Could not account for how a server exited (no exit code recorded)"
+        failed_result = Result.create_from(
+            results=[
+                Result(
+                    name="Server shutdown",
                     info=f"{message}. Check fuzzer.log.",
                     status=Result.Status.FAIL,
                 )
@@ -779,7 +818,7 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
         ):
             if cont_log.exists():
                 shutil.copy2(cont_log, host_log)
-            else:
+            elif cont_log.name not in OPTIONAL_NODE_LOGS:
                 print(f"WARNING: File {cont_log} already gone!")
             for rotated in cont_log.parent.glob(f"{cont_log.name}.*"):
                 if not rotated.is_file():
@@ -813,6 +852,7 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
     server_died = False
     forced_stop = False
     stop_failed = False
+    exit_unaccounted = False
     fuzzer_exit_code = 0
     generator_early_exit_code: int | None = None
     node_exit_codes: list[int] = []
@@ -861,6 +901,8 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
                     generator_early_exit_code = int(g.group(1))
                 if FORCED_STOP_MESSAGE in line:
                     forced_stop = True
+                if EXIT_UNACCOUNTED_MESSAGE in line:
+                    exit_unaccounted = True
                 if STOP_FAILED_MESSAGE in line:
                     stop_failed = True
     except Exception:
@@ -952,7 +994,7 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
     # kill wrote. Let those be reclassified too, but only when there is a specific verdict to
     # put in their place.
     expected_kill_only = _has_specific_failure_verdict(
-        forced_stop, stop_failed, generator_early_exit_code
+        forced_stop, stop_failed, generator_early_exit_code, exit_unaccounted
     ) and _is_expected_kill_only_failure(result)
     if not cmd_ok and (result.is_ok() or expected_kill_only):
         failed_result, info_override = _classify_failed_run(
@@ -963,6 +1005,7 @@ python3 {repo_dir}/tests/casa_del_dolor/dolor.py --seed={session_seed} --generat
             forced_stop,
             stop_failed,
             generator_early_exit_code,
+            exit_unaccounted,
         )
         if info_override and not expected_kill_only:
             print(info_override)
