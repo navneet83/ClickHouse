@@ -28,6 +28,9 @@ SANITIZER_OOM_PATTERN = f"{SANITIZER_OOM_REPORT_PATTERN}|{EXPECTED_KILL_PATTERN}
 
 class FuzzerLogParser:
     UNKNOWN_ERROR = "Unknown error"
+    # The one verdict below that does not mean a bug: it is what a run that ran out of
+    # memory reports. Named so callers can tell it from the crash verdicts.
+    MEMORY_LIMIT_ERROR = "Server unresponsive: memory limit exceeded"
     # Exception messages carry the trailing ", Stack trace (when copying this message,
     # always include the lines below):" marker, but the frames it promises are on the
     # following log lines. The failure name is built from the first line only, so the
@@ -502,7 +505,7 @@ class FuzzerLogParser:
         elif is_killed_by_signal or is_segfault:
             result_name += f" (STID: {stack_trace_id})"
         elif is_memory_limit_exceeded:
-            result_name = "Server unresponsive: memory limit exceeded"
+            result_name = self.MEMORY_LIMIT_ERROR
         elif is_sanitizer_error:
             stack_trace = self.get_sanitizer_stack_trace()
             if not stack_trace:

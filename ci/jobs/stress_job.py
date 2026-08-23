@@ -19,6 +19,13 @@ from ci.praktika.utils import Shell, Utils
 # holds the evidence.
 SERVER_LOG_FAMILY_GLOB = "clickhouse-server*.log*"
 
+# Just the current logs, `clickhouse-server.log` and its `.err.` sibling, with nothing
+# rotated. For the question "how did the server this run ended with die": a `signal 9` in a
+# rotated log belongs to an incarnation that was already replaced and restarted, and the run
+# records its own verdict for that (`Possible deadlock on shutdown`), so reading it as an
+# OOM would excuse that very failure.
+CURRENT_SERVER_LOG_GLOB = "clickhouse-server*.log"
+
 
 def sanitize_test_result_line(line: str) -> str:
     # Drop bare CR in addition to escaping NUL. The writer escapes
@@ -306,11 +313,13 @@ def run_stress_test(upgrade_check: bool = False) -> None:
             f"{result_path}/dmesg.log"
         )
 
-    # Check for OOM (signal 9) in server logs
+    # Check for OOM (signal 9) in server logs. Current logs only: this sets `is_oom`, which
+    # rewrites the whole job to OK at the end, so it must not be tripped by a kill line that
+    # describes an already-restarted server rather than this run's outcome.
     if server_log_path.exists():
         server_log_oom = Shell.check(
-            f"rg -Fqza ' <Fatal> Application: Child process was terminated by signal 9' "
-            f"{server_log_path}/{SERVER_LOG_FAMILY_GLOB}"
+            f"rg -Fqa ' <Fatal> Application: Child process was terminated by signal 9' "
+            f"{server_log_path}/{CURRENT_SERVER_LOG_GLOB}"
         )
         is_oom = is_oom or server_log_oom
 
@@ -329,6 +338,8 @@ def run_stress_test(upgrade_check: bool = False) -> None:
     test_results, additional_logs = process_results(result_path, server_log_path)
 
     server_died = False
+    # Set once the log parser names a crash, so the OOM downgrade at the end cannot bury it.
+    crash_named = False
     failed_results = []
     for test_result in test_results:
         if test_result.name == "Server died":
@@ -426,7 +437,28 @@ def run_stress_test(upgrade_check: bool = False) -> None:
                     )
 
             result = definitive_result or fallback_result
-            if result:
+            # A definitive verdict is a bug the parser recognised, except for the memory
+            # limit, which is what an out-of-memory run reports rather than a crash.
+            crash_named = (
+                definitive_result is not None
+                and definitive_result[0] != FuzzerLogParser.MEMORY_LIMIT_ERROR
+            )
+            # An expected-only verdict names a run that something else already declared
+            # failed. When `crash_evidence` alone brought us here it declared nothing: with
+            # rotated logs in scope the `<Fatal>` it found can be the expected kill itself,
+            # and reporting that would fail a run for its own restart. A `<Fatal>` the
+            # parser cannot name is not expected-only, and still reports below.
+            expected_only = (
+                definitive_result is None
+                and not server_died
+                and fallback_result is not None
+                and fallback_result[0] != FuzzerLogParser.UNKNOWN_ERROR
+            )
+            if expected_only:
+                print(
+                    f"Only expected messages in the server logs: {fallback_result[0]}"
+                )
+            elif result:
                 name, description, files = result
                 failed_results.append(
                     Result.create_from(
@@ -469,7 +501,11 @@ def run_stress_test(upgrade_check: bool = False) -> None:
         status=Result.Status.OK if not failed_results else "",
         stopwatch=stopwatch,
     )
-    if not r.is_ok() and is_oom:
+    # Running out of memory is allowed in stress tests, so it passes the run - but it does
+    # not explain a crash. A kernel OOM kill writes no `Logical error`, no assertion and no
+    # sanitizer report, so when the parser named one of those the run found a real bug and
+    # the downgrade must not bury it.
+    if not r.is_ok() and is_oom and not crash_named:
         r.set_status(Result.Status.OK)
         r.set_info("OOM error (allowed in stress tests)")
 
