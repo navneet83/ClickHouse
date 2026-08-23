@@ -284,7 +284,7 @@ def get_run_command(
 
 
 def _classify_sanitizer_oom(
-    primary_server_logs: list[Path],
+    server_logs: list[Path],
     stderr_logs: list[Path],
     server_died: bool,
     server_exit_code: int,
@@ -295,12 +295,14 @@ def _classify_sanitizer_oom(
 
     A sanitizer OOM report (e.g. "AddressSanitizer: out-of-memory") or a kernel
     SIGKILL of the server (exit 137 with no sanitizer report written) is treated
-    as OOM, not a bug. It is only downgraded to success when no node log also
-    shows a genuine non-OOM failure signal, so a node that hits both an OOM and a
-    real crash still fails. Each node is judged by its server.log, stderr.log and
-    error log together: the AST/Buzz runner merges sanitizer output into server.log,
-    but the Dolor cluster does not - there the report lands only in stderr.log, while
-    a `<Fatal>` or `Logical error` may reach only clickhouse-server.err.log.
+    as OOM, not a bug. It is only downgraded to success when no log of the run also
+    shows a genuine non-OOM failure signal, so a run that hits both an OOM and a
+    real crash still fails. Each node is judged for an OOM by its server.log,
+    stderr.log and error log together: the AST/Buzz runner merges sanitizer output
+    into server.log, but the Dolor cluster does not - there the report lands only in
+    stderr.log, while a `<Fatal>` or `Logical error` may reach only
+    clickhouse-server.err.log. `server_logs` is the full list the parser gets, the
+    per-node primaries first and anything rotated appended after.
     Returns (is_oom_success, warning_messages).
     """
     # Only a real sanitizer OOM report proves an OOM. The expected SIGKILL line is logged by
@@ -311,13 +313,11 @@ def _classify_sanitizer_oom(
     # expected SIGKILL must not veto a genuine OOM either.
     benign_pattern = SANITIZER_OOM_PATTERN
     non_oom_pattern = SANITIZER_NON_OOM_PATTERN
+    primary_server_logs = server_logs[: len(stderr_logs)]
     oom_nodes = []
-    non_oom_failure_found = False
-    # Only scan the current logs of each node (server.log, stderr.log, error log).
-    # Rotated logs may contain sanitizer signals from previous restarts that would
-    # incorrectly set non_oom_failure_found and block the OOM-is-success path; the
-    # error log is current, rotated on server open just like server.log, so a failure
-    # that reached only it belongs to this run and must veto the downgrade.
+    all_logs = []
+    # Which node OOMed is per-node: only a report in that node's current logs
+    # (server.log, stderr.log, error log) downgrades it, and the warning names it.
     for i, server_log in enumerate(primary_server_logs):
         stderr_log = stderr_logs[i] if i < len(stderr_logs) else None
         error_log = error_logs[i] if error_logs and i < len(error_logs) else None
@@ -328,20 +328,28 @@ def _classify_sanitizer_oom(
         )
         if not node_logs:
             continue
-        if Shell.get_output(f"rg --text '{oom_pattern}' {node_logs}"):
+        all_logs.append(node_logs)
+        if Shell.get_output(f"rg -z --text '{oom_pattern}' {node_logs}"):
             print(f"Sanitizer OOM on server {i}")
             oom_nodes.append(i)
-        # Run the non-OOM matcher for every node, including OOM-marked ones: a
-        # single node can hit both an OOM and a genuine crash, and the real crash
-        # must not be masked by the OOM-is-success path. Drop the benign lines
-        # themselves (a sanitizer OOM report matches non_oom_pattern via
-        # "AddressSanitizer" etc., and the expected SIGKILL via the "Signal"
-        # pattern) so neither is miscounted as a genuine failure.
-        non_oom_signal = Shell.get_output(
-            f"rg --text '{non_oom_pattern}' {node_logs} | rg --text -v '{benign_pattern}'"
+    # The veto is not per node: any genuine failure anywhere in the run blocks the
+    # downgrade, so this scan must reach every log of it, the rotated ones included. A
+    # crash can rotate out of server.log while a later benign OOM stays in it, and the
+    # workspace is wiped before the run, so nothing here predates it. Scan the OOM-marked
+    # nodes too: one node can hit both an OOM and a genuine crash, and the crash must not
+    # be masked. Drop the benign lines themselves (an OOM report matches non_oom_pattern
+    # via "AddressSanitizer" etc., and the expected SIGKILL via the "Signal" pattern) so
+    # neither is miscounted as a failure. `-z` because rotation gzips all but the newest.
+    all_logs.extend(
+        str(log) for log in server_logs[len(stderr_logs) :] if Path(log).exists()
+    )
+    non_oom_failure_found = bool(
+        all_logs
+        and Shell.get_output(
+            f"rg -z --text '{non_oom_pattern}' {' '.join(all_logs)}"
+            f" | rg --text -v '{benign_pattern}'"
         )
-        if non_oom_signal:
-            non_oom_failure_found = True
+    )
     # Sanitizer shadow memory is invisible to the server's memory tracker, so the
     # kernel OOM killer may SIGKILL the server (exit 137) before any limit fires.
     # It may also kill the watchdog, losing the "terminated by signal 9" message
@@ -383,10 +391,12 @@ def analyze_job_logs(
     error_logs: list[Path] | None = None,
 ) -> Result:
     """`error_logs`, when given, holds the current clickhouse-server.err.log of each node,
-    in the same per-node order as `stderr_logs`, so the OOM classifier sees a failure that
-    reached only the error log. Callers that merge those into `server_logs` for the parser
-    must still pass them here: only the `server_logs[:len(stderr_logs)]` slice is treated
-    per node, so anything appended past it is invisible to the classifier."""
+    in the same per-node order as `stderr_logs`, so the OOM classifier can name the node a
+    failure that reached only the error log belongs to. Callers that merge those into
+    `server_logs` for the parser must still pass them here: only the
+    `server_logs[:len(stderr_logs)]` slice is treated per node. Anything appended past it
+    is still read - it is where the rotated logs go, and they can veto the OOM downgrade -
+    but it is not attributed to a node."""
     # parse runner script exit status
     status = Result.Status.FAIL
     info = []
@@ -474,14 +484,14 @@ def analyze_job_logs(
 
     # server_logs = primary logs (one per node) + rotated logs appended after.
     # stderr_logs has exactly one entry per node, so slicing by its length
-    # isolates the primary logs. This slice is used wherever per-node
-    # semantics matter (OOM detection, fatal log extraction).
+    # isolates the primary logs, which is what per-node semantics need
+    # (the fatal log of a node below; the OOM classifier slices it likewise).
     primary_server_logs = server_logs[: len(stderr_logs)]
 
     if is_failed and not oracle_finding:
         if is_sanitized:
             is_oom_success, oom_messages = _classify_sanitizer_oom(
-                primary_server_logs,
+                server_logs,
                 stderr_logs,
                 server_died,
                 server_exit_code,
@@ -673,6 +683,14 @@ def run_fuzz_job(check_name: str):
 
     shutil.rmtree(WORKSPACE_PATH, ignore_errors=True)
     WORKSPACE_PATH.mkdir(parents=True, exist_ok=True)
+
+    if buzzhouse:
+        # After the wipe, never before it: `run-fuzzer.sh` reads `--buzz-house-config=fuzz.json`
+        # from the workspace, so a config written by the caller would be deleted here. Imported
+        # locally because `buzzhouse_job` imports this module.
+        from ci.jobs.buzzhouse_job import generate_buzz_config
+
+        generate_buzz_config(WORKSPACE_PATH, log_path="/workspace/fuzzerout.sql")
 
     info = Info()
     extra_results = []

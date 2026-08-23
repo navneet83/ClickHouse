@@ -5705,7 +5705,11 @@ class ClickHouseInstance:
                     get_exec_id=True,
                     environment=environment,
                 )
-                self.clickhouse_exec_id = exec_id
+                # Only a foreground start hands back a handle on the server itself. With
+                # `--daemon` the exec is a launcher that exits 0 as soon as it has forked,
+                # so its code says nothing about how the server later went away - reading
+                # it as the server's would turn a crash into a clean shutdown.
+                self.clickhouse_exec_id = "" if daemon else exec_id
                 if not wait_start:
                     return exec_id
                 if expected_to_fail:
@@ -6054,16 +6058,18 @@ class ClickHouseInstance:
             ],
             user="root",
         )
-        # Make sure no ClickHouse exec id is set before starting
+        # Make sure no ClickHouse exec id is set before starting, and leave it unset: this
+        # start daemonizes, so the exec is a launcher that exits 0 the moment it has forked.
+        # Keeping its id would let `_capture_clickhouse_exit` report a clean exit for a
+        # server that went on to crash. Without one the exit is honestly unaccounted for.
         self.clickhouse_exec_id = ""
         self.clickhouse_last_exit_code = None
         self.clickhouse_forced_stop = False
-        self.clickhouse_exec_id = self.exec_in_container(
+        self.exec_in_container(
             ["bash", "-c", self.clickhouse_start_command_in_daemon],
             user=str(os.getuid()),
             detach=True,
             use_cli=False,
-            get_exec_id=True,
         )
 
         # wait start
@@ -6142,16 +6148,18 @@ class ClickHouseInstance:
                     "if [ ! -f /var/lib/clickhouse/metadata/default.sql ]; then echo 'ATTACH DATABASE default ENGINE=Ordinary' > /var/lib/clickhouse/metadata/default.sql; fi",
                 ]
             )
-        # Make sure no ClickHouse exec id is set before starting
+        # Make sure no ClickHouse exec id is set before starting, and leave it unset: this
+        # start daemonizes, so the exec is a launcher that exits 0 the moment it has forked.
+        # Keeping its id would let `_capture_clickhouse_exit` report a clean exit for a
+        # server that went on to crash. Without one the exit is honestly unaccounted for.
         self.clickhouse_exec_id = ""
         self.clickhouse_last_exit_code = None
         self.clickhouse_forced_stop = False
-        self.clickhouse_exec_id = self.exec_in_container(
+        self.exec_in_container(
             ["bash", "-c", self.clickhouse_start_command_in_daemon],
             user=str(os.getuid()),
             detach=True,
             use_cli=False,
-            get_exec_id=True,
         )
 
         # wait start

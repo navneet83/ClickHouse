@@ -12,6 +12,13 @@ from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.utils import Shell, Utils
 
+# Every log of the server family, the rotated ones included, and always scanned with `rg -z`
+# because the logger gzips on rotation. This has to be the same family the log parser below
+# is handed: a crash that rotated out of the current log still belongs to this run, and a
+# narrower trigger would skip the parser for exactly the runs where only a `.log.1.gz`
+# holds the evidence.
+SERVER_LOG_FAMILY_GLOB = "clickhouse-server*.log*"
+
 
 def sanitize_test_result_line(line: str) -> str:
     # Drop bare CR in addition to escaping NUL. The writer escapes
@@ -302,8 +309,8 @@ def run_stress_test(upgrade_check: bool = False) -> None:
     # Check for OOM (signal 9) in server logs
     if server_log_path.exists():
         server_log_oom = Shell.check(
-            f"rg -Fqa ' <Fatal> Application: Child process was terminated by signal 9' "
-            f"{server_log_path}/clickhouse-server*.log"
+            f"rg -Fqza ' <Fatal> Application: Child process was terminated by signal 9' "
+            f"{server_log_path}/{SERVER_LOG_FAMILY_GLOB}"
         )
         is_oom = is_oom or server_log_oom
 
@@ -312,7 +319,8 @@ def run_stress_test(upgrade_check: bool = False) -> None:
     crash_evidence = False
     if server_log_path.exists():
         Shell.check(
-            f"rg --text '\\s<Fatal>\\s' {server_log_path}/clickhouse-server*.log > {fatal_log}"
+            f"rg -z --text '\\s<Fatal>\\s' {server_log_path}/{SERVER_LOG_FAMILY_GLOB}"
+            f" > {fatal_log}"
         )
         # rg also exits non-zero when it did match but could not read some file of
         # the glob, so key on the collected content rather than on its exit code.

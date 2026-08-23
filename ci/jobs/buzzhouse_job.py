@@ -6,7 +6,6 @@ from pathlib import Path
 
 from ci.jobs.ast_fuzzer_job import run_fuzz_job
 from ci.jobs.ci_utils import is_extended_run
-from ci.praktika.utils import Utils
 
 
 def generate_buzz_config(workspace_path: Path, log_path: str | None = None):
@@ -319,12 +318,8 @@ def generate_buzz_config(workspace_path: Path, log_path: str | None = None):
 
 
 def main():
-    temp_dir = Path(f"{Utils.cwd()}/ci/tmp/")
-    workspace_path = temp_dir / "workspace"
-    workspace_path.mkdir(parents=True, exist_ok=True)
-    # BuzzHouse runs inside Docker where workspace is mounted at /workspace
-    generate_buzz_config(workspace_path, log_path="/workspace/fuzzerout.sql")
-
+    # `run_fuzz_job` owns the workspace: it wipes it and then writes `fuzz.json` into it,
+    # with the log path BuzzHouse gets inside Docker, where it is mounted at /workspace.
     run_fuzz_job("BuzzHouse")
 
 

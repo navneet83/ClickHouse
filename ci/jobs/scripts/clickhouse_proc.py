@@ -1086,17 +1086,36 @@ clickhouse-client --query "SELECT count() FROM test.visits"
                         stderr_logs=stderr_logs or None,
                     )
                     name, description, files = log_parser.parse_failure()
-                    results.append(
-                        Result.create_from(
-                            name=name,
-                            info=description,
-                            status=Result.Status.FAIL,
-                            files=files,
-                            labels=[
-                                Result.Label.BLOCKER
-                            ],  # to explicitly block the merge
-                        )
+                    # The prefilter fires on lines a healthy run writes too (the restart
+                    # SIGKILL is `<Fatal>`, a benign OOM report matches the sanitizer
+                    # patterns), which `parse_failure` defers into "Unknown error". A name
+                    # in the second pass means only those were found and there is nothing
+                    # to block on; a `<Fatal>` no pattern claims stays unexplained.
+                    expected_only = (
+                        log_parser.parse_failure(allow_expected_only=True)[0]
+                        if name == FuzzerLogParser.UNKNOWN_ERROR
+                        else None
                     )
+                    if expected_only and expected_only != FuzzerLogParser.UNKNOWN_ERROR:
+                        results.append(
+                            Result.create_from(
+                                name="Sanitizer assert or Fatal messages in server logs",
+                                info=f"only expected messages found: {expected_only}",
+                                status=Result.Status.OK,
+                            )
+                        )
+                    else:
+                        results.append(
+                            Result.create_from(
+                                name=name,
+                                info=description,
+                                status=Result.Status.FAIL,
+                                files=files,
+                                labels=[
+                                    Result.Label.BLOCKER
+                                ],  # to explicitly block the merge
+                            )
+                        )
                 except Exception:
                     results.append(
                         Result.create_from(
