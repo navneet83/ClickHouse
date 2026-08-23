@@ -868,9 +868,9 @@ def log_server_backtrace(server) -> None:
 
 good_exit = True
 
-# Check load generator first. The generator is expected to run until the cleanup below kills
-# it, so any earlier exit is a failure whatever the code: `validate_exit_code` accepts the very
-# codes a self-terminated generator reports, and a clean 0 still means the run stopped early.
+# The generator's own `time_to_run` and `--timeout` are the same budget, so either clock can
+# win: a self-exit with 0 is a normal end of run. Any other code means it died, and
+# `validate_exit_code` cannot judge that - it accepts the codes a killed generator reports.
 killed_during_cleanup = client.process.poll() is None
 if killed_during_cleanup:
     client.process.kill()
@@ -878,7 +878,7 @@ if killed_during_cleanup:
 logger.info(f"{generator.name} exited with code: {client.process.returncode}")
 if killed_during_cleanup:
     good_exit = generator.validate_exit_code(client.process.returncode)
-else:
+elif client.process.returncode != 0:
     logger.error(
         f"{generator.name} exited on its own with code {client.process.returncode} before the run finished"
     )

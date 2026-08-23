@@ -27,6 +27,20 @@ SERVER_LOG_FAMILY_GLOB = "clickhouse-server*.log*"
 CURRENT_SERVER_LOG_GLOB = "clickhouse-server*.log"
 
 
+def _log_family(directory: Path, matches) -> List[Path]:
+    """Every file of one log family in `directory`, sorted, tolerating a missing directory."""
+    if not directory.exists():
+        return []
+    return sorted(p for p in directory.iterdir() if p.is_file() and matches(p.name))
+
+
+def _replica_logs(logs: List[Path], replica: str | None) -> List[Path]:
+    """The subset of `logs` belonging to a shared-catalog replica, or to the main one."""
+    if replica is None:
+        return [p for p in logs if "sc1" not in p.name and "sc2" not in p.name]
+    return [p for p in logs if replica in p.name]
+
+
 def sanitize_test_result_line(line: str) -> str:
     # Drop bare CR in addition to escaping NUL. The writer escapes
     # `\0\t\n` into backslash forms (`escape_tsv_info`) but not `\r`,
@@ -349,37 +363,25 @@ def run_stress_test(upgrade_check: bool = False) -> None:
             failed_results.append(test_result)
 
     if server_died or crash_evidence:
-        # One entry per replica holding its whole log family:
-        # (replica_name, [server_err_logs, rotated ones too], stderr_log).
-        # The family goes to a single parser call, because the parser defers an expected kill
-        # line only across the logs it is handed at once: split per file, the current log's
-        # benign SIGKILL would be reported and a real crash in a rotated log never reached.
-        # Main replica: all *.err.* logs without sc1/sc2 in the name, paired with stderr.log.
-        replica_log_pairs: list[tuple[str, list[Path], Path]] = []
-        err_logs = (
-            sorted(
-                p
-                for p in server_log_path.iterdir()
-                if p.is_file() and ".err." in p.name
-            )
-            if server_log_path.exists()
-            else []
-        )
+        # Both whole log families per replica, rotated files included, each handed to a single
+        # parser call: the parser defers an expected kill line only across the logs it gets at
+        # once. The runner moves the current `stderr.log` to the result directory and leaves
+        # the rotated ones in the server log directory, so that family spans both.
+        replica_log_pairs: list[tuple[str, list[Path], list[Path]]] = []
+        err_logs = _log_family(server_log_path, lambda n: ".err." in n)
+        stderr_logs = _log_family(
+            result_path, lambda n: n.startswith("stderr")
+        ) + _log_family(server_log_path, lambda n: n.startswith("stderr"))
 
-        main_stderr = result_path / "stderr.log"
-        main_server_logs = [
-            p for p in err_logs if "sc1" not in p.name and "sc2" not in p.name
-        ]
-        if main_server_logs:
-            replica_log_pairs.append(("main", main_server_logs, main_stderr))
-
-        for sc in ("sc1", "sc2"):
-            # Rotated logs included: the main filter above excludes every file named after a
-            # shared-catalog replica, so this is the only place they are ever collected.
-            sc_server_logs = [p for p in err_logs if sc in p.name]
-            sc_stderr = result_path / f"stderr-{sc}.log"
-            if sc_server_logs:
-                replica_log_pairs.append((sc, sc_server_logs, sc_stderr))
+        for replica_name, replica in (("main", None), ("sc1", "sc1"), ("sc2", "sc2")):
+            replica_server_logs = _replica_logs(err_logs, replica)
+            replica_stderr_logs = _replica_logs(stderr_logs, replica)
+            # Either family on its own is enough to classify the replica: a crash can write a
+            # sanitizer report to stderr and never create an err log at all.
+            if replica_server_logs or replica_stderr_logs:
+                replica_log_pairs.append(
+                    (replica_name, replica_server_logs, replica_stderr_logs)
+                )
 
         if not replica_log_pairs:
             failed_results.append(
@@ -393,16 +395,16 @@ def run_stress_test(upgrade_check: bool = False) -> None:
             definitive_result = None
             fallback_result = None
 
-            for replica_name, server_log_files, stderr_log in replica_log_pairs:
+            for replica_name, server_log_files, stderr_log_files in replica_log_pairs:
                 log_parser = FuzzerLogParser(
-                    server_logs=server_log_files,
-                    stderr_logs=[stderr_log] if stderr_log.exists() else None,
+                    server_logs=server_log_files or None,
+                    stderr_logs=stderr_log_files or None,
                 )
-                file_names = ", ".join(p.name for p in server_log_files)
+                file_names = ", ".join(
+                    p.name for p in (*server_log_files, *stderr_log_files)
+                )
                 try:
                     file_pair_info = f"Log files: {file_names}"
-                    if stderr_log.exists():
-                        file_pair_info += f", {stderr_log.name}"
                     # A real failure first, so that one replica's expected kill line never
                     # ends the search before another replica's crash is seen. Reached only
                     # under `server_died or crash_evidence`, so an expected-only line may
