@@ -59,7 +59,6 @@ fast_test_digest_config = Job.CacheDigestConfig(
     include_paths=[
         "./ci/jobs/fast_test.py",
         "./ci/jobs/scripts/clickhouse_proc.py",
-        "./ci/jobs/scripts/log_cluster.py",
         "./ci/jobs/scripts/server_cleanup.py",
         "./tests/queries/0_stateless/",
         "./tests/config/",
@@ -146,15 +145,16 @@ common_stress_job_config = Job.Config(
         include_paths=[
             "./tests/queries/0_stateless/",
             "./ci/jobs/stress_job.py",
+            # stress_runner.sh drives the log export through clickhouse_proc.py
             "./ci/jobs/scripts/clickhouse_proc.py",
             "./ci/jobs/scripts/log_cluster.py",
+            "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
             "./ci/jobs/scripts/stress/stress.py",
             "./tests/clickhouse-test",
             "./tests/config",
             "./tests/*.txt",
             "./tests/docker_scripts/",
             "./ci/docker/stress-test",
-            "./ci/jobs/scripts/clickhouse_proc.py",
             "./ci/jobs/scripts/log_parser.py",
         ],
     ),
@@ -1395,6 +1395,9 @@ class JobConfigs:
                 "./ci/docker/fuzzer",
                 "./ci/jobs/ast_fuzzer_job.py",
                 "./ci/jobs/scripts/log_parser.py",
+                # run-fuzzer.sh drives the log export through clickhouse_proc.py
+                "./ci/jobs/scripts/clickhouse_proc.py",
+                "./ci/jobs/scripts/log_cluster.py",
                 "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
                 "./ci/jobs/scripts/fuzzer/",
                 "./tests/config/config.d/core_dump.yaml",
@@ -1434,6 +1437,9 @@ class JobConfigs:
                 "./ci/jobs/scripts/find_symbols.py",
                 "./ci/jobs/scripts/find_tests.py",
                 "./ci/jobs/scripts/log_parser.py",
+                # run-fuzzer.sh drives the log export through clickhouse_proc.py
+                "./ci/jobs/scripts/clickhouse_proc.py",
+                "./ci/jobs/scripts/log_cluster.py",
                 "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
                 "./ci/jobs/scripts/fuzzer/",
                 "./tests/config/config.d/core_dump.yaml",
@@ -1463,6 +1469,9 @@ class JobConfigs:
                 "./ci/jobs/buzzhouse_job.py",
                 "./ci/jobs/ast_fuzzer_job.py",
                 "./ci/jobs/scripts/log_parser.py",
+                # run-fuzzer.sh drives the log export through clickhouse_proc.py
+                "./ci/jobs/scripts/clickhouse_proc.py",
+                "./ci/jobs/scripts/log_cluster.py",
                 "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh",
                 "./ci/jobs/scripts/fuzzer/",
                 "./tests/config/config.d/core_dump.yaml",
