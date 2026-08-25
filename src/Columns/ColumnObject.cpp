@@ -1275,11 +1275,18 @@ void ColumnObject::updateHashWithValue(size_t n, SipHash & hash) const
 
 void ColumnObject::updateHashWithValueRange(size_t begin, size_t end, SipHash & hash) const
 {
+    /// Typed paths are always in the same order for all instances of the same Object type,
+    /// so there is no need to hash the paths themselves.
     for (const auto & path : sorted_typed_paths)
         typed_paths.find(path)->second->updateHashWithValueRange(begin, end, hash);
 
+    /// Dynamic paths may differ, so we hash the paths together with values.
     for (const auto & path : sorted_dynamic_paths)
+    {
+        hash.update(path.size());
+        hash.update(path);
         dynamic_paths.find(path)->second->updateHashWithValueRange(begin, end, hash);
+    }
 
     shared_data->updateHashWithValueRange(begin, end, hash);
 }
@@ -2253,7 +2260,13 @@ int ColumnObject::SortedPathsIterator::compare(const SortedPathsIterator & rhs, 
     if (path != rhs_path)
         return path < rhs_path ? -1 : 1;
 
-    /// If paths are equal, compare their values.
+    /// If paths are equal, compare their values. When both values live in shared data they are
+    /// already serialized in Dynamic binary form, so compare them directly via
+    /// ColumnDynamic::compareSerializedValues (same order as the materializing path). Any other
+    /// combination keeps the materializing path unchanged.
+    if (current_path_type == PathType::SHARED_DATA && rhs.current_path_type == PathType::SHARED_DATA)
+        return ColumnDynamic::compareSerializedValues(getCurrentSharedDataValue(), rhs.getCurrentSharedDataValue(), nan_direction_hint);
+
     auto [column, n] = getCurrentPathColumnAndRow();
     auto [rhs_column, rhs_n] = rhs.getCurrentPathColumnAndRow();
     return column->compareAt(n, rhs_n, *rhs_column, nan_direction_hint);
@@ -2335,6 +2348,11 @@ std::pair<ColumnPtr, size_t> ColumnObject::SortedPathsIterator::getCurrentPathCo
         }
     }
 };
+
+std::string_view ColumnObject::SortedPathsIterator::getCurrentSharedDataValue() const
+{
+    return shared_data_values->getDataAt(shared_data_it);
+}
 
 ColumnObject::SortedPathsIterator::PathInfo ColumnObject::SortedPathsIterator::getCurrentPathInfo() const
 {
