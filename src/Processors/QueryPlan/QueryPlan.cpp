@@ -812,7 +812,6 @@ void QueryPlan::explainPipeline(WriteBuffer & buffer, const ExplainPipelineOptio
 }
 
 
-
 namespace QueryPlanOptimizations
 {
 
@@ -826,7 +825,6 @@ bool verifyDistributedAggregation(QueryPlan::Node & node, QueryPlan::Nodes & nod
 std::optional<PreformattedMessage> traversePlanForUnsupportedDistributedStep(QueryPlan::Node & root, const QueryPlanOptimizationSettings & optimization_settings);
 void validateDistributedPlanBucketCounts(const QueryPlanOptimizationSettings & optimization_settings);
 }
-
 
 
 std::optional<PreformattedMessage> hasPlanUnsupportedStepForDistributed(QueryPlan::Node & root, const QueryPlanOptimizationSettings & optimization_settings);
