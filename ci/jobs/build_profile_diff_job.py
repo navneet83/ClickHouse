@@ -200,6 +200,17 @@ def in_list(values) -> str:
     return ", ".join(quote(v) for v in values)
 
 
+def repo_condition(repo: str) -> str:
+    """Rows of one repository, still admitting rows uploaded before `repo` existed.
+
+    `repo` was added to the profile tables by `ALTER TABLE ... ADD COLUMN`, so
+    every historical row carries the type default `''`. Without the empty
+    branch the whole pre-migration history, master baselines included, becomes
+    invisible. Drop it once those rows are backfilled.
+    """
+    return f"(repo = {quote(repo)} OR repo = '')"
+
+
 def recent_days(days: int) -> str:
     """A `date` condition covering the last `days` days up to today."""
     return f"date >= today() - {days}"
@@ -296,7 +307,7 @@ def resolve_run(
         f"""SELECT check_start_time, instance_id
         FROM {table}
         WHERE {date_condition}
-            AND repo = {quote(repo)}
+            AND {repo_condition(repo)}
             AND pull_request_number = {pr_number}
             AND commit_sha = {quote(sha)}
             AND check_name = {quote(check_name)}
@@ -312,7 +323,7 @@ def side_conditions(side: Side, extra_where: str = "") -> str:
     """The WHERE conditions selecting one side's rows, pinned to its build run."""
     where = f"\n            AND {extra_where}" if extra_where else ""
     return f"""{side.date_condition}
-            AND repo = {quote(side.repo)}
+            AND {repo_condition(side.repo)}
             AND pull_request_number = {side.pr_number}
             AND commit_sha = {quote(side.sha)}
             AND check_name = {quote(side.check_name)}
@@ -623,7 +634,7 @@ def find_baseline(db: Db, master_shas: List[str], pr_sha: str, date_condition: s
         f"""SELECT DISTINCT commit_sha
         FROM binary_sizes
         WHERE {date_condition}
-            AND repo = {quote(repo)}
+            AND {repo_condition(repo)}
             AND pull_request_number = 0
             AND check_name = {quote(CHECK_NAME)}
             AND file = {quote(MAIN_BINARY)}
@@ -654,7 +665,7 @@ def find_warmup_baseline(db: Db, master_shas: List[str], pr_sha: str, date_condi
         f"""SELECT DISTINCT commit_sha
         FROM binary_sizes
         WHERE {date_condition}
-            AND repo = {quote(repo)}
+            AND {repo_condition(repo)}
             AND pull_request_number = 0
             AND check_name = {quote(WARMUP_CHECK_NAME)}
             AND commit_sha IN ({in_list(candidates)})"""
@@ -671,7 +682,7 @@ def has_pr_data(db: Db, pr_number: int, pr_sha: str, repo: str) -> bool:
         f"""SELECT count() AS c
         FROM binary_sizes
         WHERE {recent_days(PR_DAYS)}
-            AND repo = {quote(repo)}
+            AND {repo_condition(repo)}
             AND pull_request_number = {pr_number}
             AND commit_sha = {quote(pr_sha)}
             AND check_name = {quote(CHECK_NAME)}
@@ -1070,7 +1081,7 @@ def compare_compile_times(db: Db, pr_side, master_shas, date_condition: str) -> 
             argMax(instance_id, time) AS instance_id
         FROM build_time_trace
         WHERE {date_condition}
-            AND repo = {quote(pr_side.repo)}
+            AND {repo_condition(pr_side.repo)}
             AND pull_request_number = 0
             AND check_name = {quote(WARMUP_CHECK_NAME)}
             AND name = 'ExecuteCompiler'
@@ -1107,7 +1118,7 @@ def compare_compile_times(db: Db, pr_side, master_shas, date_condition: str) -> 
             f"""SELECT count() AS c
             FROM build_time_trace
             WHERE {date_condition}
-                AND repo = {quote(pr_side.repo)}
+                AND {repo_condition(pr_side.repo)}
                 AND pull_request_number = 0
                 AND check_name = {quote(WARMUP_CHECK_NAME)}
                 AND name = 'ExecuteCompiler'
