@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import json
+import math
 import os
 import pathlib
 import random
@@ -9,12 +10,39 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from environment import set_environment_variables
+from properties import (
+    KEEPER_SESSION_EXPIRE_SLEEP_SECONDS,
+    SERVER_SETTLE_SLEEP_SECONDS,
+    SERVER_START_WAIT_SECONDS,
+)
 from tests.integration.helpers.client import CommandRequest
-from tests.integration.helpers.cluster import ClickHouseInstance
+from tests.integration.helpers.cluster import (
+    ClickHouseInstance,
+    SLOW_BUILD_STOP_WAIT_SECONDS,
+)
 from tests.integration.helpers.config_cluster import (
     pg_pass,
     mysql_pass,
     mongo_pass,
+)
+
+# The load generator stays on `node0` for the whole run while `dolor.py` restarts a randomly
+# chosen server, so about half the ClickHouse restarts take its own connection down. Give it a
+# reconnect budget that outlasts a whole restart, or it reports the deliberate downtime as a
+# lost server and fails the run: the graceful stop (which `stop_clickhouse` stretches to
+# `SLOW_BUILD_STOP_WAIT_SECONDS` on sanitizer and coverage builds), the sleeps around the
+# binary swap, and the wait for the new server to answer. This does not delay reporting a
+# server that died for real, because `dolor.py` notices that from the missing process within a
+# second and kills the generator itself.
+BUZZHOUSE_RECONNECT_SLEEP_SECONDS = 3
+BUZZHOUSE_RECONNECT_ATTEMPTS = math.ceil(
+    (
+        SLOW_BUILD_STOP_WAIT_SECONDS
+        + SERVER_SETTLE_SLEEP_SECONDS
+        + KEEPER_SESSION_EXPIRE_SLEEP_SECONDS
+        + SERVER_START_WAIT_SECONDS
+    )
+    / BUZZHOUSE_RECONNECT_SLEEP_SECONDS
 )
 
 
@@ -69,6 +97,12 @@ class BuzzHouseGenerator(Generator):
                 buzz_config = json.load(file1)
 
         buzz_config["seed"] = random.randint(1, 18446744073709551615)
+
+        # Outlast a deliberate restart of the server the generator is attached to
+        buzz_config["max_reconnection_attempts"] = BUZZHOUSE_RECONNECT_ATTEMPTS
+        buzz_config["time_to_sleep_between_reconnects"] = (
+            BUZZHOUSE_RECONNECT_SLEEP_SECONDS * 1000
+        )
 
         # Set paths
         buzz_config["client_file_path"] = (

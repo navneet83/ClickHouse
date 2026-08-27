@@ -40,6 +40,9 @@ from generators import Generator, BuzzHouseGenerator
 from leaks import ElOracloDeLeaks
 from oracles import ElOraculoDeTablas
 from properties import (
+    KEEPER_SESSION_EXPIRE_SLEEP_SECONDS,
+    SERVER_SETTLE_SLEEP_SECONDS,
+    SERVER_START_WAIT_SECONDS,
     SERVER_STOP_WAIT_SECONDS,
     modify_server_settings,
     modify_user_settings,
@@ -716,7 +719,7 @@ while all_running and (not reached_limit):
             logger.error(f"Failed to stop ClickHouse: {ex}")
             logger.info(f"The server {next_pick.name} is not running")
             all_running = False
-        time.sleep(1)
+        time.sleep(SERVER_SETTLE_SLEEP_SECONDS)
         # Replace server binary, using a new temporary symlink
         if (
             all_running
@@ -743,9 +746,11 @@ while all_running and (not reached_limit):
             )
             server_versions[next_pick.name] = next_server
         if all_running:
-            time.sleep(3)  # Let the keeper session expire
+            time.sleep(KEEPER_SESSION_EXPIRE_SLEEP_SECONDS)
             try:
-                next_pick.start_clickhouse(start_wait_sec=10, retry_start=False)
+                next_pick.start_clickhouse(
+                    start_wait_sec=SERVER_START_WAIT_SECONDS, retry_start=False
+                )
             except Exception as ex:
                 logger.error(f"Failed to start ClickHouse: {ex}")
                 logger.info(f"The server {next_pick.name} is not running")
