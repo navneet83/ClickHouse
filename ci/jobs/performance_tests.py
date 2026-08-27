@@ -1269,6 +1269,58 @@ def rebuild_table(port, source, destination):
 
 POPULATE_DONE_MARKER = "test._populate_done"
 
+# Iceberg datasets unpacked into user_files, as <database> -> (directory, tables).
+# Unlike the MergeTree datasets, these cannot ship their own metadata/<db>.sql in
+# the tarball: IcebergLocal stores an absolute path and user_files_path differs
+# between the two compared servers, so the DDL is generated per server in
+# Configure. The data itself must live physically inside user_files - IcebergLocal
+# rejects a path that resolves outside it (DataLakeConfiguration.h) - which also
+# means it cannot be a symlink.
+ICEBERG_DATASETS = {
+    "tpch_ice10": (
+        "tpch_ice_sf10",
+        (
+            "nation",
+            "region",
+            "supplier",
+            "part",
+            "customer",
+            "partsupp",
+            "orders",
+            "lineitem",
+        ),
+    ),
+}
+
+# Derived, not hand-maintained: adding a dataset above is enough to protect it
+# from the between-tests user_files wipe.
+PERSISTENT_USER_FILES = {directory for directory, _ in ICEBERG_DATASETS.values()}
+
+
+def iceberg_database_ddl_commands(server_path):
+    """Shell commands that attach the Iceberg datasets as databases on one server.
+
+    Mirrors how the tpch10 tarball ships metadata/tpch10.sql, except the DDL is
+    written here because it carries a server-specific absolute path. Must run
+    after the `cp -al` of db0: writing into db0 first would leave the two servers
+    sharing one inode per .sql file, and rewriting one would silently rewrite the
+    other.
+    """
+    user_files = f"{server_path}/db/user_files"
+    metadata = f"{server_path}/db/metadata"
+    commands = []
+    for database, (directory, tables) in ICEBERG_DATASETS.items():
+        commands.append(f"mkdir -p {metadata}/{database}")
+        commands.append(
+            f'echo "ATTACH DATABASE {database} ENGINE=Ordinary" > {metadata}/{database}.sql'
+        )
+        for table in tables:
+            commands.append(
+                f"echo \"ATTACH TABLE {table} ENGINE = IcebergLocal('{user_files}/{directory}/{table}/')\""
+                f" > {metadata}/{database}/{table}.sql"
+            )
+    return commands
+
 
 def populate_data(port):
     # Rebuild the hits datasets on one server, sequentially. The three inserts
@@ -1528,6 +1580,7 @@ def main():
                 "hits1": "https://clickhouse-datasets.s3.amazonaws.com/hits/partitions/hits_v1.tar",
                 "values": "https://clickhouse-datasets.s3.amazonaws.com/values_with_expressions/partitions/test_values.tar",
                 "tpch10": "https://clickhouse-datasets.s3.amazonaws.com/h/10/tpch_sf10.tar",
+                "tpch_ice10": "https://clickhouse-datasets.s3.amazonaws.com/h-ice/10/tpch_ice_sf10.tar",
                 "tpcds1": "https://clickhouse-datasets.s3.amazonaws.com/ds/scale_1/tpcds.tar",
             }
             stop_watch = Utils.Stopwatch()
@@ -1581,6 +1634,12 @@ def main():
             # cores (must run after the right->left config copy above).
             write_max_threads_override,
         ]
+        # Attach the Iceberg datasets as databases, so tests read tpch_ice10.<table>
+        # with no create_query of their own. The dataset files themselves arrive
+        # under db/user_files with the `cp -al` above, hardlinked, so both servers
+        # share the data blocks without either being able to disturb the other.
+        commands += iceberg_database_ddl_commands(perf_left)
+        commands += iceberg_database_ddl_commands(perf_right)
         results.append(Result.from_commands_run(name="Configure", command=commands))
         res = results[-1].is_ok()
 
@@ -1661,6 +1720,11 @@ def main():
                 if not user_files.is_dir():
                     continue
                 for entry in user_files.iterdir():
+                    # Dataset directories unpacked here are shared by every test and
+                    # must outlive them. They are real directories, not symlinks, so
+                    # the is_symlink() check below does not cover them.
+                    if entry.name in PERSISTENT_USER_FILES:
+                        continue
                     if entry.is_symlink():
                         continue
                     if entry.is_dir():
