@@ -1,0 +1,86 @@
+<test profile_all_queries="1">
+    <settings>
+        <iceberg_metadata_log_level>none</iceberg_metadata_log_level>
+        <iceberg_delete_data_on_drop>1</iceberg_delete_data_on_drop>
+    </settings>
+
+    <!-- READ suite over a single IcebergLocal table converted from the CI-attached
+         tpch10.lineitem dataset (60M rows, ~5.8 GiB uncompressed, ~1.8 GiB as Parquet).
+         Local data-lake paths must live inside user_files_path, resolved dynamically,
+         with a per-run unique suffix to avoid clashing with aborted runs.
+         Decimal(15,2) measures are converted to Float64: the Iceberg writer does not
+         support creating Decimal columns.
+         PARTITION BY month(l_shipdate) yields 84 partitions (1992-01..1998-12); the
+         fill below is a single-stream ordered insert with large blocks, so each
+         partition gets exactly one data file with a tight l_shipdate min/max range.
+         (The default parallel insert path explodes into per-(block x partition)
+         writers and exhausts the global thread pool on an 84-partition insert.) -->
+    <create_query>DROP TABLE IF EXISTS iceberg_suite_lineitem</create_query>
+    <create_query>
+        CREATE TABLE iceberg_suite_lineitem
+        (
+            l_orderkey Int32,
+            l_partkey Int32,
+            l_suppkey Int32,
+            l_linenumber Int32,
+            l_quantity Float64,
+            l_extendedprice Float64,
+            l_discount Float64,
+            l_tax Float64,
+            l_returnflag String,
+            l_linestatus String,
+            l_shipdate Date,
+            l_commitdate Date,
+            l_receiptdate Date,
+            l_shipinstruct String,
+            l_shipmode String,
+            l_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_lineitem_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+        PARTITION BY toMonthNumSinceEpoch(l_shipdate)
+    </create_query>
+
+    <fill_query>
+        INSERT INTO iceberg_suite_lineitem SELECT * FROM tpch10.lineitem
+        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
+    </fill_query>
+
+    <!-- point_lookup_warm: single-day predicate prunes to one data file via partition and per-file min/max stats, metadata from the cache. -->
+    <query>SELECT count(), sum(l_extendedprice) FROM iceberg_suite_lineitem WHERE l_shipdate = toDate('1994-06-15')</query>
+
+    <!-- point_lookup_cold: same lookup with the metadata cache off, so the diff against the warm variant is the metadata parse cost. -->
+    <query>SELECT count(), sum(l_extendedprice) FROM iceberg_suite_lineitem WHERE l_shipdate = toDate('1994-06-15') SETTINGS use_iceberg_metadata_files_cache = 0</query>
+
+    <!-- range_scan: bounded three-month scan; prunes 81 of 84 files, then decodes a contiguous slice. -->
+    <query>SELECT count(), avg(l_discount) FROM iceberg_suite_lineitem WHERE l_shipdate &gt;= toDate('1994-01-01') AND l_shipdate &lt; toDate('1994-04-01')</query>
+
+    <!-- full_scan_agg_warm: TPC-H Q1-style aggregation over all 60M rows, no pruning; dominated by Parquet decode and aggregation. -->
+    <query>SELECT l_returnflag, l_linestatus, sum(l_quantity), avg(l_extendedprice), count() FROM iceberg_suite_lineitem GROUP BY l_returnflag, l_linestatus</query>
+
+    <!-- full_scan_agg_cold: the cold half of the cold/warm metadata pair on the full-scan shape. -->
+    <query>SELECT l_returnflag, l_linestatus, sum(l_quantity), avg(l_extendedprice), count() FROM iceberg_suite_lineitem GROUP BY l_returnflag, l_linestatus SETTINGS use_iceberg_metadata_files_cache = 0</query>
+
+    <!-- partition_prune_single_month: filter aligned with the month partition transform; signal IcebergPartitionPrunedFiles ~ 83. -->
+    <query>SELECT count(), sum(l_quantity) FROM iceberg_suite_lineitem WHERE l_shipdate &gt;= toDate('1995-01-01') AND l_shipdate &lt; toDate('1995-02-01') SETTINGS use_iceberg_partition_pruning = 1</query>
+
+    <!-- minmax_prune_edge: the last shipping day lives in the last file only, the rest are skipped via min/max stats; signal IcebergMinMaxIndexPrunedFiles ~ 83. -->
+    <query>SELECT count() FROM iceberg_suite_lineitem WHERE l_shipdate = toDate('1998-12-01')</query>
+
+    <!-- prune_negative_control: predicate spans every file's range, nothing prunes; the walk over all manifest entries is in every run. -->
+    <query>SELECT count(), min(l_shipdate) FROM iceberg_suite_lineitem WHERE l_shipdate &gt;= toDate('1990-01-01')</query>
+
+    <!-- string_filter: selective LIKE over l_comment in all files; predicate evaluation over a long String column. -->
+    <query>SELECT count() FROM iceberg_suite_lineitem WHERE l_comment LIKE '%special%'</query>
+
+    <!-- join_fact_dim: Iceberg fact joined with the MergeTree dimension it came from, right side bounded to ~6 months of orders. -->
+    <query>SELECT count() FROM iceberg_suite_lineitem AS l INNER JOIN tpch10.orders AS o ON l.l_orderkey = o.o_orderkey WHERE o.o_orderdate &lt; toDate('1992-06-01')</query>
+
+    <!-- trivial_count: no predicate; answerable from snapshot-level row counts without touching data files. -->
+    <query>SELECT count() FROM iceberg_suite_lineitem</query>
+
+    <!-- column_projection: reads 2 of 16 columns; Parquet column pruning on the classic revenue expression. -->
+    <query>SELECT sum(l_extendedprice * (1 - l_discount)) FROM iceberg_suite_lineitem</query>
+
+    <drop_query>DROP TABLE IF EXISTS iceberg_suite_lineitem</drop_query>
+</test>
