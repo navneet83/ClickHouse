@@ -296,9 +296,18 @@ std::string StorageObjectStorageSource::getUniqueStoragePathIdentifier(
     if (path.starts_with("/"))
         path = path.substr(1);
 
-    std::string result = include_connection_info
-        ? fs::path(configuration.getDataSourceDescription()) / path
-        : fs::path(configuration.getNamespace()) / path;
+    const size_t scheme_end
+        = configuration.isDataLakeConfiguration() && configuration.getType() == ObjectStorageType::S3
+        ? path.find("://")
+        : std::string::npos;
+
+    std::string result;
+    if (scheme_end != std::string::npos)
+        result = path.substr(scheme_end + 3);
+    else if (include_connection_info)
+        result = fs::path(configuration.getDataSourceDescription()) / path;
+    else
+        result = fs::path(configuration.getNamespace()) / path;
 
     /// For web URL shards the same relative path can be produced by different expanded URL options
     /// (e.g. `http://{host1,host2}/data/**`). Including `read_source_index` keeps schema/count cache
@@ -568,7 +577,7 @@ Chunk StorageObjectStorageSource::generate()
 
             const auto reading_path = configuration->getPathForRead().path;
 
-            if (!full_path.starts_with(reading_path))
+            if (!full_path.starts_with(reading_path) && !full_path.contains("://"))
                 full_path = fs::path(reading_path) / object_info->getPath();
 
             auto object_metadata = object_info->getObjectMetadata();
