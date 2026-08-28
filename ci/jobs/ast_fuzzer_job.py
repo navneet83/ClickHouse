@@ -532,13 +532,37 @@ def analyze_job_logs(
             stderr_logs=stderr_logs,
             fuzzer_log=fuzzer_out,
         )
-        # `is_failed` above already decided the run failed, so an expected-only line may
-        # name it rather than losing the reason to "Unknown error".
-        parsed_name, parsed_info, files = fuzzer_log_parser.parse_failure(
-            allow_expected_only=True
-        )
+        # A genuine match first, same as the OOM classifier above: `server_logs` now
+        # carries Dolor's rotated logs too, and a sanitizer OOM report that lives only in
+        # one is exactly what that classifier already refuses to call current-log
+        # evidence (see its docstring - it may belong to a restart that already
+        # finished). Naming it here as a plain FAIL would make this function return a
+        # specific, non-reclassifiable verdict, and the Dolor wrapper's own rotated-log
+        # judgement (`_classify_rotated_logs`) only ever runs when this function returns
+        # OK. So an expected-only match is named only to check what it is, not to report
+        # a failure from it.
+        parsed_name, parsed_info, files = fuzzer_log_parser.parse_failure()
+        if parsed_name == FuzzerLogParser.UNKNOWN_ERROR:
+            expected_name, expected_info, expected_files = (
+                fuzzer_log_parser.parse_failure(allow_expected_only=True)
+            )
+            if expected_name != FuzzerLogParser.UNKNOWN_ERROR and re.search(
+                SANITIZER_OOM_REPORT_PATTERN, expected_info
+            ):
+                info.append(
+                    f"WARNING: {expected_name} - only found in a log this function does "
+                    "not treat as current-log evidence - test considered passed"
+                )
+                status = Result.Status.OK
+                is_failed = False
+            else:
+                parsed_name, parsed_info, files = (
+                    expected_name,
+                    expected_info,
+                    expected_files,
+                )
 
-        if parsed_name:
+        if is_failed and parsed_name:
             results.append(
                 Result(
                     name=parsed_name,
