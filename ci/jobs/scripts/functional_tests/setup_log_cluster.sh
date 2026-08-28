@@ -14,13 +14,6 @@ set -e
 # Pre-configured destination cluster, where to export the data
 CLICKHOUSE_CI_LOGS_CLUSTER=${CLICKHOUSE_CI_LOGS_CLUSTER:-system_logs_export}
 
-# Both are built from LogCluster.META_COLUMNS (ci/jobs/scripts/log_cluster.py)
-# and exported by the job that runs this script. A default here would be a
-# second definition free to drift from the expression it must match.
-echo "EXTRA_COLUMNS=${EXTRA_COLUMNS:?}"
-echo "EXTRA_COLUMNS_EXPRESSION=${EXTRA_COLUMNS_EXPRESSION:?}"
-EXTRA_ORDER_BY_COLUMNS=${EXTRA_ORDER_BY_COLUMNS:-"check_name"}
-
 function __set_connection_args()
 {
     # It's impossible to use a generic $CONNECTION_ARGS string, it's unsafe from word splitting perspective.
@@ -90,6 +83,14 @@ function setup_logs_replication()
     # The function is launched in a separate shell instance to not expose the
     # exported values
     set +x
+
+    # Only the setup path needs these, so the stop path can run without them.
+    # Both are built from LogCluster.META_COLUMNS (ci/jobs/scripts/log_cluster.py)
+    # and exported by the job that runs this script. A default here would be a
+    # second definition free to drift from the expression it must match.
+    echo "EXTRA_COLUMNS=${EXTRA_COLUMNS:?}"
+    echo "EXTRA_COLUMNS_EXPRESSION=${EXTRA_COLUMNS_EXPRESSION:?}"
+    EXTRA_ORDER_BY_COLUMNS=${EXTRA_ORDER_BY_COLUMNS:-"check_name"}
 
     if [[ -n "$CLICKHOUSE_CI_LOGS_HOST" ]]; then
         check_logs_credentials
