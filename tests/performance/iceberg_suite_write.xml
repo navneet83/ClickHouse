@@ -1,59 +1,205 @@
+<!-- https://clickhouse.com/docs/getting-started/example-datasets/tpch -->
+<!-- Scale factor: 10 -->
 <test profile_all_queries="1">
     <settings>
+        <allow_insert_into_iceberg>1</allow_insert_into_iceberg>
+        <mutations_sync>2</mutations_sync>
         <iceberg_metadata_log_level>none</iceberg_metadata_log_level>
         <iceberg_delete_data_on_drop>1</iceberg_delete_data_on_drop>
     </settings>
 
-    <!-- WRITE suite: INSERT and mutation paths of IcebergLocal, fed from the
-         CI-attached tpch10.lineitem dataset. Each measured query owns a dedicated
-         table so the (randomized) query execution order cannot create
+    <!-- WRITE suite: the INSERT, mutation and schema-evolution paths of
+         `IcebergLocal`, fed from the CI-attached `tpch10` MergeTree dataset.
+
+         The measured INSERTs target the eight TPC-H tables, created here with the
+         same schema `iceberg_suite_tpch` used before the read side moved to the
+         shipped `tpch_ice10` dataset. The schema is not the one of
+         `tests/benchmarks/tpc-h/init.sql`: the Iceberg writer maps neither
+         `Decimal` nor `FixedString` (`Iceberg::getIcebergType`, throws
+         `Unsupported type for iceberg`), so measures are `Float64` and fixed text
+         is `String`. `Decimal` to `Float64` and `FixedString` to `String` happen
+         implicitly in `INSERT ... SELECT`. Money is therefore floating point, a
+         deviation from the TPC-H datatype requirements, but what this suite
+         measures is the write path, not query results.
+
+         Every measured query owns a dedicated table, so the randomized query
+         execution order (the `max_queries` option of `perf.py`) cannot create
          cross-query dependencies. Measured INSERTs append on every run: per-run
-         work stays constant, the tables just grow. All inserts use the ordered
-         single-stream + large-block pattern; the default parallel insert into a
-         partitioned Iceberg table spawns per-(block x partition) writers and can
-         exhaust the global thread pool. -->
+         work stays constant, the tables just grow. Measured UPDATEs are copy-on-write
+         rewrites of the same row set every run, so their work is constant too.
+
+         Every INSERT is an ordered single-stream insert with a block large enough
+         to hold the whole source: `max_threads = 1` keeps the row set of a
+         `LIMIT` identical on the two compared servers, and one block means one
+         data file per partition per commit, so the commit shape does not drift.
+         The default parallel insert into a partitioned Iceberg table also spawns
+         per-(block x partition) writers and can exhaust the global thread pool.
+
+         Local data-lake paths must live inside `user_files_path`, resolved
+         dynamically, with a per-run unique suffix to avoid clashing with aborted
+         runs. `cleanup_user_files` in `ci/jobs/performance_tests.py` wipes them
+         between tests. -->
     <substitutions>
         <substitution>
-            <name>del_n</name>
+            <name>database</name>
             <values>
-                <value>0</value>
-                <value>1</value>
-                <value>2</value>
-                <value>3</value>
-                <value>4</value>
-                <value>5</value>
-                <value>6</value>
-                <value>7</value>
-                <value>8</value>
-                <value>9</value>
+                <value>iceberg_suite_write</value>
+            </values>
+        </substitution>
+        <substitution>
+            <name>table</name>
+            <values>
+                <value>nation</value>
+                <value>region</value>
+                <value>part</value>
+                <value>supplier</value>
+                <value>partsupp</value>
+                <value>customer</value>
+                <value>orders</value>
+                <value>lineitem</value>
             </values>
         </substitution>
     </substitutions>
 
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_ins_bulk</create_query>
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_ins_part</create_query>
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_ins_files</create_query>
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_ins_bucket</create_query>
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_mut_upd</create_query>
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_mut_del</create_query>
-    <create_query>DROP TABLE IF EXISTS iceberg_suite_mor</create_query>
+    <create_query>CREATE DATABASE IF NOT EXISTS {database}</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.{table}</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.mut_upd</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.mut_upd_part</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.mut_del</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.mut_del_part</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.evo</create_query>
+    <create_query>DROP TABLE IF EXISTS {database}.evo_mod</create_query>
 
-    <!-- ins_bulk: unpartitioned target for pure write-throughput + single-commit tax. -->
+    <!-- The eight INSERT targets. They start empty; the measured INSERTs fill them. -->
+
     <create_query>
-        CREATE TABLE iceberg_suite_ins_bulk
+        CREATE TABLE {database}.nation
         (
-            l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
-            l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
-            l_returnflag String, l_linestatus String,
-            l_shipdate Date, l_commitdate Date, l_receiptdate Date,
-            l_shipinstruct String, l_shipmode String, l_comment String
+            n_nationkey Int32,
+            n_name String,
+            n_regionkey Int32,
+            n_comment String
         )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_ins_bulk_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_nation_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- ins_part: month-partitioned target; the first 4M ordered rows span ~9 months, so each insert commits ~9 data files. -->
     <create_query>
-        CREATE TABLE iceberg_suite_ins_part
+        CREATE TABLE {database}.region
+        (
+            r_regionkey Int32,
+            r_name String,
+            r_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_region_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.part
+        (
+            p_partkey Int32,
+            p_name String,
+            p_mfgr String,
+            p_brand String,
+            p_type String,
+            p_size Int32,
+            p_container String,
+            p_retailprice Float64,
+            p_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_part_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.supplier
+        (
+            s_suppkey Int32,
+            s_name String,
+            s_address String,
+            s_nationkey Int32,
+            s_phone String,
+            s_acctbal Float64,
+            s_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_supplier_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.partsupp
+        (
+            ps_partkey Int32,
+            ps_suppkey Int32,
+            ps_availqty Int32,
+            ps_supplycost Float64,
+            ps_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_partsupp_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.customer
+        (
+            c_custkey Int32,
+            c_name String,
+            c_address String,
+            c_nationkey Int32,
+            c_phone String,
+            c_acctbal Float64,
+            c_mktsegment String,
+            c_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_customer_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.orders
+        (
+            o_orderkey Int32,
+            o_custkey Int32,
+            o_orderstatus String,
+            o_totalprice Float64,
+            o_orderdate Date,
+            o_orderpriority String,
+            o_clerk String,
+            o_shippriority Int32,
+            o_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_orders_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.lineitem
+        (
+            l_orderkey Int32,
+            l_partkey Int32,
+            l_suppkey Int32,
+            l_linenumber Int32,
+            l_quantity Float64,
+            l_extendedprice Float64,
+            l_discount Float64,
+            l_tax Float64,
+            l_returnflag String,
+            l_linestatus String,
+            l_shipdate Date,
+            l_commitdate Date,
+            l_receiptdate Date,
+            l_shipinstruct String,
+            l_shipmode String,
+            l_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_lineitem_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <!-- Mutation and schema-evolution targets, all `lineitem`-shaped and pre-filled.
+         `mut_upd` / `mut_del` are unpartitioned, so a predicate that scatters over
+         the key space touches every data file; `mut_upd_part` / `mut_del_part` use
+         the Iceberg `month` transform on `l_shipdate` (`toMonthNumSinceEpoch`), and
+         because TPC-H ship dates spread over 1992-01..1998-12 independently of
+         `l_orderkey`, any ordered prefix of `lineitem` lands in all 84 monthly
+         partitions. The pair lets the same kind of mutation be measured once
+         against every data file and once against a single one. -->
+
+    <create_query>
+        CREATE TABLE {database}.mut_upd
         (
             l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
             l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
@@ -61,13 +207,24 @@
             l_shipdate Date, l_commitdate Date, l_receiptdate Date,
             l_shipinstruct String, l_shipmode String, l_comment String
         )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_ins_part_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_mut_upd_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <create_query>
+        CREATE TABLE {database}.mut_upd_part
+        (
+            l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
+            l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
+            l_returnflag String, l_linestatus String,
+            l_shipdate Date, l_commitdate Date, l_receiptdate Date,
+            l_shipinstruct String, l_shipmode String, l_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_mut_upd_part_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
         PARTITION BY toMonthNumSinceEpoch(l_shipdate)
     </create_query>
 
-    <!-- ins_files: unpartitioned target for the small-file fan-out variant. -->
     <create_query>
-        CREATE TABLE iceberg_suite_ins_files
+        CREATE TABLE {database}.mut_del
         (
             l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
             l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
@@ -75,12 +232,11 @@
             l_shipdate Date, l_commitdate Date, l_receiptdate Date,
             l_shipinstruct String, l_shipmode String, l_comment String
         )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_ins_files_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_mut_del_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- ins_bucket: 8-way hash-bucket partitioning; measures the bucket transform partitioner on the write path. -->
     <create_query>
-        CREATE TABLE iceberg_suite_ins_bucket
+        CREATE TABLE {database}.mut_del_part
         (
             l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
             l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
@@ -88,13 +244,12 @@
             l_shipdate Date, l_commitdate Date, l_receiptdate Date,
             l_shipinstruct String, l_shipmode String, l_comment String
         )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_ins_bucket_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-        PARTITION BY icebergBucket(8, l_orderkey)
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_mut_del_part_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+        PARTITION BY toMonthNumSinceEpoch(l_shipdate)
     </create_query>
 
-    <!-- mut_upd / mut_del / mor: pre-filled targets for the mutation queries. -->
     <create_query>
-        CREATE TABLE iceberg_suite_mut_upd
+        CREATE TABLE {database}.evo
         (
             l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
             l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
@@ -102,102 +257,145 @@
             l_shipdate Date, l_commitdate Date, l_receiptdate Date,
             l_shipinstruct String, l_shipmode String, l_comment String
         )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_mut_upd_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-    <create_query>
-        CREATE TABLE iceberg_suite_mut_del
-        (
-            l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
-            l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
-            l_returnflag String, l_linestatus String,
-            l_shipdate Date, l_commitdate Date, l_receiptdate Date,
-            l_shipinstruct String, l_shipmode String, l_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_mut_del_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-    <create_query>
-        CREATE TABLE iceberg_suite_mor
-        (
-            l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
-            l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
-            l_returnflag String, l_linestatus String,
-            l_shipdate Date, l_commitdate Date, l_receiptdate Date,
-            l_shipinstruct String, l_shipmode String, l_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_mor_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_evo_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
+    <create_query>
+        CREATE TABLE {database}.evo_mod
+        (
+            l_orderkey Int32, l_partkey Int32, l_suppkey Int32, l_linenumber Int32,
+            l_quantity Float64, l_extendedprice Float64, l_discount Float64, l_tax Float64,
+            l_returnflag String, l_linestatus String,
+            l_shipdate Date, l_commitdate Date, l_receiptdate Date,
+            l_shipinstruct String, l_shipmode String, l_comment String
+        )
+        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_evo_mod_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
+    </create_query>
+
+    <!-- 2M rows is a compromise: large enough that a copy-on-write rewrite is
+         dominated by Parquet encoding rather than by the commit, small enough that
+         the rewrite stays inside the 15 s `max_execution_time` that `perf.py` puts
+         on every measured run (the `max_query_seconds` option). -->
     <fill_query>
-        INSERT INTO iceberg_suite_mut_upd SELECT * FROM tpch10.lineitem LIMIT 4000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
-    </fill_query>
-    <fill_query>
-        INSERT INTO iceberg_suite_mut_del SELECT * FROM tpch10.lineitem LIMIT 4000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
-    </fill_query>
-    <fill_query>
-        INSERT INTO iceberg_suite_mor SELECT * FROM tpch10.lineitem LIMIT 4000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
-    </fill_query>
-
-    <!-- Ten setup deletes, one position-delete commit each, so mor_read pays a stable merge-on-read tax of 10 delete files. -->
-    <fill_query>
-        ALTER TABLE iceberg_suite_mor DELETE WHERE l_orderkey % 200000 = {del_n}
-        SETTINGS allow_insert_into_iceberg = 1, mutations_sync = 2
-    </fill_query>
-
-    <!-- ins_bulk_4m: single-stream 4M-row insert, one data file, one commit; Parquet write throughput plus commit tax. -->
-    <query>
-        INSERT INTO iceberg_suite_ins_bulk SELECT * FROM tpch10.lineitem LIMIT 4000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
-    </query>
-
-    <!-- ins_part_4m: same volume into the partitioned table; the delta against ins_bulk_4m is partitioning and the multi-file commit. -->
-    <query>
-        INSERT INTO iceberg_suite_ins_part SELECT * FROM tpch10.lineitem LIMIT 4000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
-    </query>
-
-    <!-- ins_small_files: 20 data files per commit via the per-file row cap; manifest-entry fan-out on the commit path. -->
-    <query>
-        INSERT INTO iceberg_suite_ins_files SELECT * FROM tpch10.lineitem LIMIT 2000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0,
-                 iceberg_insert_max_rows_in_data_file = 100000
-    </query>
-
-    <!-- ins_bucket_2m: hash-bucket partitioner splits each block 8 ways. -->
-    <query>
-        INSERT INTO iceberg_suite_ins_bucket SELECT * FROM tpch10.lineitem LIMIT 2000000
-        SETTINGS allow_insert_into_iceberg = 1, max_threads = 1, max_insert_threads = 1,
+        INSERT INTO {database}.mut_upd SELECT * FROM tpch10.lineitem LIMIT 2000000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
                  min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0
-    </query>
+    </fill_query>
+    <fill_query>
+        INSERT INTO {database}.mut_upd_part SELECT * FROM tpch10.lineitem LIMIT 2000000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0
+    </fill_query>
+    <fill_query>
+        INSERT INTO {database}.mut_del SELECT * FROM tpch10.lineitem LIMIT 2000000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0
+    </fill_query>
+    <fill_query>
+        INSERT INTO {database}.mut_del_part SELECT * FROM tpch10.lineitem LIMIT 2000000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0
+    </fill_query>
+    <fill_query>
+        INSERT INTO {database}.evo SELECT * FROM tpch10.lineitem LIMIT 2000000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0
+    </fill_query>
 
-    <!-- upd_fixed: predicate on an immutable column matches the same ~40K rows every run, so per-run work is constant. -->
+    <!-- `evo_mod` only ever gets metadata-only ALTERs, so it holds a token amount of
+         data: what its measured query costs is reading, rewriting and committing the
+         `.metadata.json`, not touching data files. -->
+    <fill_query>
+        INSERT INTO {database}.evo_mod SELECT * FROM tpch10.lineitem LIMIT 1000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 1000, min_insert_block_size_bytes = 0
+    </fill_query>
+
+    <!-- Schema evolution of `evo`, applied once at setup rather than measured.
+         `ADD COLUMN` / `DROP COLUMN` / `RENAME COLUMN` cannot be measured queries:
+         `perf.py` reruns a query up to 31 times per server, and the second run of
+         each of them throws - `MetadataGenerator::generateDropColumnMetadata` and
+         `generateRenameColumnMetadata` raise `Not found column`, and
+         `generateAddColumnMetadata` raises `Column already exists`. `IF EXISTS` /
+         `IF NOT EXISTS` do not help either: `AlterCommands::prepare` only marks the
+         command `ignore`, and `StorageObjectStorage::alter` still forwards it to
+         `Iceberg::alter`. What is left to measure is what these commits cost the
+         reader afterwards, which is the interesting part anyway: they are
+         metadata-only, so no data file is rewritten and every subsequent scan has to
+         reconcile the current schema with the schema each data file was written
+         with.
+         Iceberg only allows adding a nullable column
+         (`generateAddColumnMetadata` refuses a non-nullable one). -->
+    <fill_query>ALTER TABLE {database}.evo ADD COLUMN l_extra Nullable(Int64)</fill_query>
+    <fill_query>ALTER TABLE {database}.evo RENAME COLUMN l_comment TO l_comment_v2</fill_query>
+    <fill_query>ALTER TABLE {database}.evo DROP COLUMN l_shipinstruct</fill_query>
+
+    <!-- insert_[table]: append the source table into its Iceberg twin, one ordered
+         stream, one block, one data file, one commit. The row cap is uniform across
+         the eight tables and is a no-op for the six that are smaller than it; it
+         bounds `partsupp` (8M), `orders` (15M) and `lineitem` (60M) so that a single
+         run fits in the 15 s `max_execution_time` of a measured run. -->
     <query>
-        ALTER TABLE iceberg_suite_mut_upd UPDATE l_quantity = l_quantity + 1 WHERE l_orderkey % 100 = 0
-        SETTINGS allow_insert_into_iceberg = 1, mutations_sync = 2
+        INSERT INTO {database}.{table} SELECT * FROM tpch10.{table} LIMIT 4000000
+        SETTINGS max_threads = 1, max_insert_threads = 1,
+                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
     </query>
 
-    <!-- del_point: deletes real rows only on the first run; later runs measure the mutation planning path over an empty match. -->
+    <!-- upd_every_file: 10% of the rows, scattered over the whole key space, so
+         Iceberg's copy-on-write rewrites every data file of the table. `l_partkey` is
+         dense in TPC-H, unlike the sparse `l_orderkey`, so `% 10` selects exactly one
+         row in ten and the same rows on every run: per-run work is constant, and the
+         table neither grows nor shrinks because the rewritten files replace the old
+         ones. -->
+    <query>ALTER TABLE {database}.mut_upd UPDATE l_quantity = l_quantity + 1 WHERE l_partkey % 10 = 0</query>
+
+    <!-- upd_one_file: the same shape of mutation confined to one of the 84 monthly
+         partitions, so only that partition's data file is rewritten. The delta
+         against upd_every_file is how much of the cost is the rewrite itself rather
+         than mutation planning and the commit. -->
     <query>
-        ALTER TABLE iceberg_suite_mut_del DELETE WHERE l_orderkey = 721220
-        SETTINGS allow_insert_into_iceberg = 1, mutations_sync = 2
+        ALTER TABLE {database}.mut_upd_part UPDATE l_quantity = l_quantity + 1
+        WHERE l_shipdate &gt;= toDate('1995-06-01') AND l_shipdate &lt; toDate('1995-07-01') AND l_partkey % 10 = 0
     </query>
 
-    <!-- mor_read: full read of a table carrying 10 position-delete files; stable merge-on-read apply cost. -->
-    <query>SELECT sum(l_extendedprice), count() FROM iceberg_suite_mor</query>
+    <!-- del_every_file: a `DELETE` is merge-on-read - it writes position deletes
+         instead of rewriting data - so the first run creates the delete files for 10%
+         of the rows and every later run finds nothing left to delete. What is
+         measured from the second run on is therefore the steady state: mutation
+         planning plus a full scan of the table with the delete files applied, over an
+         already-deleted slice. That state is stable, which is what the median needs.
+    -->
+    <query>ALTER TABLE {database}.mut_del DELETE WHERE l_suppkey % 10 = 0</query>
 
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_ins_bulk</drop_query>
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_ins_part</drop_query>
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_ins_files</drop_query>
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_ins_bucket</drop_query>
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_mut_upd</drop_query>
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_mut_del</drop_query>
-    <drop_query>DROP TABLE IF EXISTS iceberg_suite_mor</drop_query>
+    <!-- del_one_file: the same delete restricted to a single monthly partition, so
+         partition pruning keeps the scan to one data file. -->
+    <query>
+        ALTER TABLE {database}.mut_del_part DELETE
+        WHERE l_shipdate &gt;= toDate('1996-03-01') AND l_shipdate &lt; toDate('1996-04-01') AND l_suppkey % 10 = 0
+    </query>
+
+    <!-- evo_modify_type: the one schema ALTER that is repeatable. `int` widens to
+         `long` on the first run and `long` to `long` afterwards, both of which
+         `checkValidSchemaEvolution` accepts, so the query measures the cost of a
+         metadata-only schema commit: read the `.metadata.json`, append a schema,
+         write it back, write the version hint, invalidate the metadata cache. -->
+    <query>ALTER TABLE {database}.evo_mod MODIFY COLUMN l_partkey Int64</query>
+
+    <!-- evo_read_added: `l_extra` exists in the current schema but in none of the data
+         files, so every scan materializes it as a constant NULL column. -->
+    <query>SELECT count(), countIf(l_extra IS NULL) FROM {database}.evo</query>
+
+    <!-- evo_read_renamed: the data files still carry the column under its old name;
+         resolving `l_comment_v2` goes through the field-id mapping. The `LIKE` keeps
+         the query on the read path of a long `String` column rather than on
+         `count()`. -->
+    <query>SELECT count() FROM {database}.evo WHERE l_comment_v2 LIKE '%special%'</query>
+
+    <drop_query>DROP TABLE IF EXISTS {database}.{table}</drop_query>
+    <drop_query>DROP TABLE IF EXISTS {database}.mut_upd</drop_query>
+    <drop_query>DROP TABLE IF EXISTS {database}.mut_upd_part</drop_query>
+    <drop_query>DROP TABLE IF EXISTS {database}.mut_del</drop_query>
+    <drop_query>DROP TABLE IF EXISTS {database}.mut_del_part</drop_query>
+    <drop_query>DROP TABLE IF EXISTS {database}.evo</drop_query>
+    <drop_query>DROP TABLE IF EXISTS {database}.evo_mod</drop_query>
 </test>
