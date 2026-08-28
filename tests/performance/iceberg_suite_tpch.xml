@@ -4,175 +4,37 @@
     <settings file="../benchmarks/tpc-h/settings.json"/>
     <settings>
         <max_bytes_ratio_before_external_join>0</max_bytes_ratio_before_external_join>
-        <allow_insert_into_iceberg>1</allow_insert_into_iceberg>
         <iceberg_metadata_log_level>none</iceberg_metadata_log_level>
-        <iceberg_delete_data_on_drop>1</iceberg_delete_data_on_drop>
     </settings>
 
-    <!-- TPC-H suite: the 22 queries of tpch.xml, unchanged, over IcebergLocal tables
-         instead of MergeTree ones. The tables are converted from the CI-attached
-         tpch10 dataset, so the test brings no dataset of its own; the query files are
-         shared with tpch.xml, which is why the tables live in a database of their own
-         and are named exactly as the queries expect.
-         The schema cannot be taken from tests/benchmarks/tpc-h/init.sql as is:
-         `default_table_engine` is an enum without `IcebergLocal` that cannot carry the
-         engine's path argument, `init.sql` declares MergeTree `PRIMARY KEY`, and the
-         Iceberg writer supports neither `Decimal` nor `FixedString`, so measures are
-         `Float64` and fixed text is `String` here. Money is therefore floating point,
-         a deviation from the TPC-H datatype requirements that makes results differ
-         slightly from tpch.xml; what this suite measures is the Iceberg read path.
-         Local data-lake paths must live inside user_files_path, resolved dynamically,
-         with a per-run unique suffix to avoid clashing with aborted runs. -->
+    <!-- TPC-H suite: the 22 queries of tpch.xml, unchanged, over the CI-attached
+         Iceberg TPC-H SF10 dataset instead of the MergeTree one. The dataset is
+         downloaded as a tarball and attached as the `tpch_ice10` database in
+         Configure, so this suite builds nothing: it has no create_query and no
+         conversion insert of its own, and the measured time is the Iceberg read
+         path rather than a read plus a rebuild of the tables.
+
+         Because the tables now ship with the dataset, they carry the types the
+         TPC-H schema calls for (`tests/benchmarks/tpc-h/init.sql`): measures are
+         `Decimal(12, 2)` and fixed text is `FixedString(N)`, so the results match
+         `tpch.xml` instead of deviating through `Float64` money. Dates read back
+         as `Date32`, because Iceberg's `date` is 32-bit.
+
+         Nothing here drops a table, and `iceberg_delete_data_on_drop` must stay
+         off: the dataset is shared by both compared servers and by every other
+         test in the run, so a DROP would delete its files. -->
     <substitutions>
         <substitution>
             <name>database</name>
             <values>
-                <value>iceberg_suite_tpch</value>
-            </values>
-        </substitution>
-        <substitution>
-            <name>table</name>
-            <values>
-                <value>nation</value>
-                <value>region</value>
-                <value>part</value>
-                <value>supplier</value>
-                <value>partsupp</value>
-                <value>customer</value>
-                <value>orders</value>
-                <value>lineitem</value>
+                <value>tpch_ice10</value>
             </values>
         </substitution>
     </substitutions>
 
-    <create_query>CREATE DATABASE IF NOT EXISTS {database}</create_query>
-    <create_query>DROP TABLE IF EXISTS {database}.{table}</create_query>
-
-    <create_query>
-        CREATE TABLE {database}.nation
-        (
-            n_nationkey Int32,
-            n_name String,
-            n_regionkey Int32,
-            n_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_nation_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.region
-        (
-            r_regionkey Int32,
-            r_name String,
-            r_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_region_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.part
-        (
-            p_partkey Int32,
-            p_name String,
-            p_mfgr String,
-            p_brand String,
-            p_type String,
-            p_size Int32,
-            p_container String,
-            p_retailprice Float64,
-            p_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_part_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.supplier
-        (
-            s_suppkey Int32,
-            s_name String,
-            s_address String,
-            s_nationkey Int32,
-            s_phone String,
-            s_acctbal Float64,
-            s_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_supplier_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.partsupp
-        (
-            ps_partkey Int32,
-            ps_suppkey Int32,
-            ps_availqty Int32,
-            ps_supplycost Float64,
-            ps_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_partsupp_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.customer
-        (
-            c_custkey Int32,
-            c_name String,
-            c_address String,
-            c_nationkey Int32,
-            c_phone String,
-            c_acctbal Float64,
-            c_mktsegment String,
-            c_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_customer_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.orders
-        (
-            o_orderkey Int32,
-            o_custkey Int32,
-            o_orderstatus String,
-            o_totalprice Float64,
-            o_orderdate Date,
-            o_orderpriority String,
-            o_clerk String,
-            o_shippriority Int32,
-            o_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_orders_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <create_query>
-        CREATE TABLE {database}.lineitem
-        (
-            l_orderkey Int32,
-            l_partkey Int32,
-            l_suppkey Int32,
-            l_linenumber Int32,
-            l_quantity Float64,
-            l_extendedprice Float64,
-            l_discount Float64,
-            l_tax Float64,
-            l_returnflag String,
-            l_linestatus String,
-            l_shipdate Date,
-            l_commitdate Date,
-            l_receiptdate Date,
-            l_shipinstruct String,
-            l_shipmode String,
-            l_comment String
-        )
-        ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_tpch_lineitem_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
-    </create_query>
-
-    <!-- The tables are unpartitioned, so the ordered single-stream insert is only needed to keep one data file per table; `Decimal` to `Float64` and `FixedString` to `String` happen implicitly. -->
-    <fill_query>
-        INSERT INTO {database}.{table} SELECT * FROM tpch10.{table}
-        SETTINGS max_threads = 1, max_insert_threads = 1,
-                 min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
-    </fill_query>
-
-    <!-- The query files below use unqualified table names, as in tpch.xml. -->
+    <!-- The query files below use unqualified table names, as in tpch.xml, so the
+         session has to point at the dataset's database. This is the only setup
+         statement the suite needs. -->
     <fill_query>USE {database}</fill_query>
 
     <!-- Q1 -->  <query file="../benchmarks/tpc-h/queries/query_01.sql"/>
@@ -197,7 +59,4 @@
     <!-- Q20 --> <query file="../benchmarks/tpc-h/queries/query_20.sql"/>
     <!-- Q21 --> <query file="../benchmarks/tpc-h/queries/query_21.sql"/>
     <!-- Q22 --> <query file="../benchmarks/tpc-h/queries/query_22.sql"/>
-
-    <!-- The database itself is kept: Q15 is multi-statement, so its `DROP VIEW revenue0` is hoisted into the teardown and runs after these drop queries. -->
-    <drop_query>DROP TABLE IF EXISTS {database}.{table}</drop_query>
 </test>
