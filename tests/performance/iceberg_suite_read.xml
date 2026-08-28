@@ -3,22 +3,7 @@
         <iceberg_metadata_log_level>none</iceberg_metadata_log_level>
     </settings>
 
-    <!-- READ suite over `tpch_ice10.lineitem`, the CI-attached Iceberg TPC-H SF10
-         dataset (60M rows, 84 data files, ~1.8 GiB of Parquet). The dataset is
-         downloaded as a tarball and attached as a database in Configure, so this
-         suite builds nothing: there is no create_query, and the measured time is
-         read path only rather than read plus a 60M-row conversion insert.
-
-         The tables carry the TPC-H types: measures are `Decimal(12, 2)` and fixed
-         text is `FixedString(N)`, matching `tests/benchmarks/tpc-h/init.sql`.
-         Dates read back as `Date32`, because Iceberg's `date` is 32-bit.
-
-         `PARTITION BY month(l_shipdate)` yields 84 partitions (1992-01..1998-12),
-         one data file each, so a single-month predicate prunes 83 of 84 files.
-
-         Nothing here drops a table: the dataset is shared by both compared servers
-         and by every other test in the run. In particular `iceberg_delete_data_on_drop`
-         must stay off, or a DROP would delete the shared dataset's files. -->
+    <!-- READ suite over the CI-attached `tpch_ice10` Iceberg dataset (60M rows, 84 monthly partitions, one data file each); nothing is built or dropped, and `iceberg_delete_data_on_drop` must stay off because the dataset is shared. -->
 
     <!-- point_lookup_warm: single-day predicate prunes to one data file via partition and per-file min/max stats, metadata from the cache. -->
     <query>SELECT count(), sum(l_extendedprice) FROM tpch_ice10.lineitem WHERE l_shipdate = toDate('1994-06-15')</query>

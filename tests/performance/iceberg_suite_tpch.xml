@@ -7,22 +7,7 @@
         <iceberg_metadata_log_level>none</iceberg_metadata_log_level>
     </settings>
 
-    <!-- TPC-H suite: the 22 queries of tpch.xml, unchanged, over the CI-attached
-         Iceberg TPC-H SF10 dataset instead of the MergeTree one. The dataset is
-         downloaded as a tarball and attached as the `tpch_ice10` database in
-         Configure, so this suite builds nothing: it has no create_query and no
-         conversion insert of its own, and the measured time is the Iceberg read
-         path rather than a read plus a rebuild of the tables.
-
-         Because the tables now ship with the dataset, they carry the types the
-         TPC-H schema calls for (`tests/benchmarks/tpc-h/init.sql`): measures are
-         `Decimal(12, 2)` and fixed text is `FixedString(N)`, so the results match
-         `tpch.xml` instead of deviating through `Float64` money. Dates read back
-         as `Date32`, because Iceberg's `date` is 32-bit.
-
-         Nothing here drops a table, and `iceberg_delete_data_on_drop` must stay
-         off: the dataset is shared by both compared servers and by every other
-         test in the run, so a DROP would delete its files. -->
+    <!-- The 22 queries of tpch.xml, unchanged, over the CI-attached `tpch_ice10` Iceberg dataset; nothing is built or dropped here, and `iceberg_delete_data_on_drop` must stay off because the dataset is shared. -->
     <substitutions>
         <substitution>
             <name>database</name>
@@ -32,9 +17,7 @@
         </substitution>
     </substitutions>
 
-    <!-- The query files below use unqualified table names, as in tpch.xml, so the
-         session has to point at the dataset's database. This is the only setup
-         statement the suite needs. -->
+    <!-- The query files use unqualified table names, as in tpch.xml, so the session has to point at the dataset's database. -->
     <fill_query>USE {database}</fill_query>
 
     <!-- Q1 -->  <query file="../benchmarks/tpc-h/queries/query_01.sql"/>

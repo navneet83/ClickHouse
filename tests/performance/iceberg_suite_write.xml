@@ -8,45 +8,7 @@
         <iceberg_delete_data_on_drop>1</iceberg_delete_data_on_drop>
     </settings>
 
-    <!-- WRITE suite: the INSERT, mutation and maintenance paths of `IcebergLocal`,
-         fed from the CI-attached `tpch10` MergeTree dataset.
-
-         The measured INSERTs target the eight TPC-H tables, created here with the
-         same schema `iceberg_suite_tpch` used before the read side moved to the
-         shipped `tpch_ice10` dataset. The schema is not the one of
-         `tests/benchmarks/tpc-h/init.sql`: the Iceberg writer maps neither
-         `Decimal` nor `FixedString` (`Iceberg::getIcebergType`, throws
-         `Unsupported type for iceberg`), so measures are `Float64` and fixed text
-         is `String`. `Decimal` to `Float64` and `FixedString` to `String` happen
-         implicitly in `INSERT ... SELECT`. Money is therefore floating point, a
-         deviation from the TPC-H datatype requirements, but what this suite
-         measures is the write path, not query results.
-
-         Every measured query owns a dedicated table, so the randomized query
-         execution order (the `max_queries` option of `perf.py`) cannot create
-         cross-query dependencies. Measured INSERTs append on every run: per-run
-         work stays constant, the tables just grow. Measured UPDATEs are
-         copy-on-write rewrites of the same row set every run, so their work is
-         constant too. The maintenance commands do their work on the first run and
-         then return early without throwing, so from the second run on they measure
-         their scan and planning over an already-tidy table; that state is stable,
-         which is what the median needs.
-
-         Unless a query says otherwise, every INSERT is an ordered single-stream
-         insert with a block large enough to hold the whole source: `max_threads = 1`
-         keeps the row set of a `LIMIT` identical on the two compared servers, and
-         one block means one data file per partition per commit, so the commit shape
-         does not drift. Rollover to a new data file only happens on a chunk
-         boundary (`MultipleFileWriter::consume`), which is why
-         `iceberg_insert_max_rows_in_data_file` has no effect unless the block size
-         comes down with it. The default parallel insert into a partitioned Iceberg
-         table also spawns per-(block x partition) writers and can exhaust the
-         global thread pool.
-
-         Local data-lake paths must live inside `user_files_path`, resolved
-         dynamically, with a per-run unique suffix to avoid clashing with aborted
-         runs. `cleanup_user_files` in `ci/jobs/performance_tests.py` wipes them
-         between tests. -->
+    <!-- WRITE suite: the INSERT, mutation and maintenance paths of `IcebergLocal` fed from the CI-attached `tpch10` dataset, one dedicated table per measured query so the randomized query order cannot couple them. -->
     <substitutions>
         <substitution>
             <name>database</name>
@@ -67,8 +29,7 @@
                 <value>lineitem</value>
             </values>
         </substitution>
-        <!-- One commit per value: the seeded tables carry `seed` snapshots, manifests
-             and data files before anything is measured. -->
+        <!-- One commit per value: the seeded tables carry 32 snapshots, manifests and data files before anything is measured. -->
         <substitution>
             <name>seed</name>
             <values>
@@ -151,7 +112,7 @@
     <create_query>DROP TABLE IF EXISTS {database}.maint_orphan</create_query>
     <create_query>DROP TABLE IF EXISTS {database}.mor</create_query>
 
-    <!-- The eight INSERT targets. They start empty; the measured INSERTs fill them. -->
+    <!-- The eight INSERT targets, empty at start; measures are `Float64` and fixed text is `String` because `Iceberg::getIcebergType` maps neither `Decimal` nor `FixedString`. -->
 
     <create_query>
         CREATE TABLE {database}.nation
@@ -270,14 +231,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_lineitem_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- Mutation targets, all `lineitem`-shaped and pre-filled. `mut_upd` / `mut_del`
-         are unpartitioned, so a predicate that scatters over the key space touches
-         every data file; `mut_upd_part` / `mut_del_part` use the Iceberg `month`
-         transform on `l_shipdate`, and because TPC-H ship dates spread over
-         1992-01..1998-12 independently of `l_orderkey`, any ordered prefix of
-         `lineitem` lands in all 84 monthly partitions. The pair lets the same kind of
-         mutation be measured once against every data file and once against a single
-         one. -->
+    <!-- Mutation targets: `mut_upd` / `mut_del` unpartitioned so a scattered predicate touches every data file, `mut_upd_part` / `mut_del_part` on the `month` transform so it touches one of 84. -->
 
     <create_query>
         CREATE TABLE {database}.mut_upd
@@ -329,17 +283,7 @@
         PARTITION BY toMonthNumSinceEpoch(l_shipdate)
     </create_query>
 
-    <!-- Partition-transform targets. `ChunkPartitioner` computes the partition value
-         per row, so `bucket` and `truncate` pay a hash / arithmetic cost per row that
-         the date transforms do not, and the number of open writers per commit is the
-         partition cardinality. `bucket[8]` and `truncate[250000]` on the 2M dense
-         TPC-H part keys both yield 8 partitions, so their difference is the transform
-         alone; `month` yields 84 and identity on `l_returnflag` yields 3, which is the
-         separate cardinality dimension. All four take the same source as the
-         unpartitioned `insert_lineitem` query, which is their baseline.
-         The supported transforms are listed in `Iceberg::getPartitionField`: identity,
-         `toYearNumSinceEpoch`, `toMonthNumSinceEpoch`, `toRelativeDayNum`,
-         `toRelativeHourNum`, `icebergTruncate` and `icebergBucket`. -->
+    <!-- Partition-transform targets: `bucket[8]` and `truncate[250000]` both yield 8 partitions so their delta is the per-row transform, `month` (84) and identity (3) vary the cardinality. -->
 
     <create_query>
         CREATE TABLE {database}.tf_month
@@ -393,11 +337,7 @@
         PARTITION BY l_returnflag
     </create_query>
 
-    <!-- Small-file fan-out, parallel write and non-Parquet write targets, all
-         unpartitioned so that `insert_lineitem` is their baseline. `ORC` carries
-         Iceberg-specific `String` / `FixedString` logical-type handling in
-         `ORCBlockOutputFormat` keyed on the column mapper, which nothing else in the
-         suite covers. -->
+    <!-- Small-file, parallel-write and ORC targets, unpartitioned so insert_lineitem is their baseline. -->
 
     <create_query>
         CREATE TABLE {database}.ins_small_files
@@ -435,10 +375,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_fmt_orc_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'ORC')
     </create_query>
 
-    <!-- Commit-depth pair: identical tiny inserts, one into a table that already
-         carries 32 snapshots and manifests and one into a fresh table. The difference
-         is the part of a commit that scales with the existing manifest list, which is
-         what `iceberg_manifest_min_count_to_compact` exists to bound. -->
+    <!-- Commit-depth pair: the same tiny insert onto 32 existing snapshots and onto none, isolating the part of a commit that scales with the manifest list. -->
 
     <create_query>
         CREATE TABLE {database}.commit_shallow
@@ -464,10 +401,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_commit_deep_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- Statistics pair: the same 8M values written as 32 columns x 250K rows and as
-         1 column x 8M rows. `MultipleFileWriter::consume` runs `DataFileStatistics`
-         per column per chunk, so equal bytes with a 32x column count isolates the
-         per-column statistics and Parquet column overhead from the encoding itself. -->
+    <!-- Statistics pair: 8M values as 32 columns and as 1, since `MultipleFileWriter::consume` runs `DataFileStatistics` per column per chunk. -->
 
     <create_query>
         CREATE TABLE {database}.stat_wide
@@ -488,9 +422,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_stat_narrow_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- Nested types: `getIcebergType` maps `Tuple` to struct, `Array` to list and
-         `Map` to map, assigning field ids recursively. TPC-H has no nested column, so
-         this is the only coverage of that path on the write side. -->
+    <!-- Nested types: `getIcebergType` maps `Tuple` to struct, `Array` to list and `Map` to map, and TPC-H has no nested column. -->
 
     <create_query>
         CREATE TABLE {database}.nested
@@ -503,13 +435,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_nested_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- Metadata-commit variants, each measured with the same tiny insert as
-         `commit_shallow`, which is their baseline. `iceberg_use_version_hint` is a
-         storage setting, so it goes on the table; `iceberg_metadata_compression_method`
-         and `write_full_path_in_iceberg_metadata` are read from the query context in
-         `IcebergMetadata::createInitial`, and a trailing `SETTINGS` clause on
-         `CREATE TABLE` is parsed as storage settings, so they have to be set on the
-         session around the `CREATE`. -->
+    <!-- Metadata-commit variants; `iceberg_use_version_hint` is a storage setting, the other two are read from the query context in `IcebergMetadata::createInitial` so they are set on the session. -->
 
     <create_query>
         CREATE TABLE {database}.meta_hint
@@ -552,12 +478,7 @@
     </create_query>
     <create_query>SET write_full_path_in_iceberg_metadata = 0</create_query>
 
-    <!-- Maintenance targets. Each is seeded with 32 commits so the command has real
-         work on its first run: `maint_compact` gets 32 small data files to rewrite,
-         `maint_manifest` 32 manifests to consolidate, `maint_expire` 33 snapshots to
-         expire down to one, and `maint_orphan` a directory of 32 data files, 32
-         manifests and 33 metadata files to list and reconcile against the reachable
-         set. -->
+    <!-- Maintenance targets, each seeded with 32 commits so the command has real work on its first run. -->
 
     <create_query>
         CREATE TABLE {database}.maint_compact
@@ -607,10 +528,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_maint_orphan_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- Merge-on-read target: 10 position-delete commits over one table, so the
-         measured scan pays a stable delete-apply tax in `PositionDeleteTransform`.
-         `iceberg_delete_manifests.xml` covers decoding many delete manifests; this
-         covers applying them to the data. -->
+    <!-- Merge-on-read target: 10 position-delete commits, so the measured scan pays a stable delete-apply tax in `PositionDeleteTransform`. -->
 
     <create_query>
         CREATE TABLE {database}.mor
@@ -624,10 +542,7 @@
         ENGINE = IcebergLocal((SELECT value FROM system.server_settings WHERE name = 'user_files_path') || '/iceberg_suite_write_mor_' || toString(toUnixTimestamp64Micro(now64(6))) || '/', 'Parquet')
     </create_query>
 
-    <!-- 2M rows is a compromise: large enough that a copy-on-write rewrite is
-         dominated by Parquet encoding rather than by the commit, small enough that
-         the rewrite stays inside the 15 s `max_execution_time` that `perf.py` puts
-         on every measured run (the `max_query_seconds` option). -->
+    <!-- 2M rows: enough that a copy-on-write rewrite is dominated by Parquet encoding, few enough that it fits the 15 s `max_execution_time` of a measured run. -->
     <fill_query>
         INSERT INTO {database}.mut_upd SELECT * FROM tpch10.lineitem LIMIT 2000000
         SETTINGS max_threads = 1, max_insert_threads = 1,
@@ -654,13 +569,10 @@
                  min_insert_block_size_rows = 2000000, min_insert_block_size_bytes = 0
     </fill_query>
 
-    <!-- Ten setup deletes, one position-delete commit each, so the `mor` scan pays a
-         merge-on-read tax of 10 delete files. -->
+    <!-- Ten setup deletes, one position-delete commit each. -->
     <fill_query>ALTER TABLE {database}.mor DELETE WHERE l_partkey % 200000 = {del_n}</fill_query>
 
-    <!-- Seed commits. `l_partkey` is dense in TPC-H, unlike the sparse `l_orderkey`,
-         so every value of `seed` matches rows and every one of these inserts really
-         does commit a snapshot. -->
+    <!-- Seed commits; `l_partkey` is dense in TPC-H, unlike the sparse `l_orderkey`, so every `seed` value really commits a snapshot. -->
     <fill_query>
         INSERT INTO {database}.commit_deep SELECT * FROM tpch10.lineitem WHERE l_partkey % 32 = {seed} LIMIT 100
         SETTINGS max_threads = 1, max_insert_threads = 1,
@@ -687,52 +599,32 @@
                  min_insert_block_size_rows = 100, min_insert_block_size_bytes = 0
     </fill_query>
 
-    <!-- insert_[table]: append the source table into its Iceberg twin, one ordered
-         stream, one block, one data file, one commit. The row cap is uniform across
-         the eight tables and is a no-op for the six that are smaller than it; it
-         bounds `partsupp` (8M), `orders` (15M) and `lineitem` (60M) so that a single
-         run fits in the 15 s `max_execution_time` of a measured run. -->
+    <!-- insert_[table]: one ordered stream, one block, one commit; `max_threads = 1` pins the `LIMIT` row set across servers and the cap keeps `partsupp` / `orders` / `lineitem` inside the 15 s measured-run limit. -->
     <query>
         INSERT INTO {database}.{table} SELECT * FROM tpch10.{table} LIMIT 4000000
         SETTINGS max_threads = 1, max_insert_threads = 1,
                  min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
     </query>
 
-    <!-- upd_every_file: 10% of the rows, scattered over the whole key space, so
-         Iceberg's copy-on-write rewrites every data file of the table. `l_partkey` is
-         dense in TPC-H, unlike the sparse `l_orderkey`, so `% 10` selects exactly one
-         row in ten and the same rows on every run: per-run work is constant, and the
-         table neither grows nor shrinks because the rewritten files replace the old
-         ones. -->
+    <!-- upd_every_file: `l_partkey` is dense so `% 10` is exactly one row in ten scattered over every data file, and copy-on-write rewrites the whole table with the same rows every run. -->
     <query>ALTER TABLE {database}.mut_upd UPDATE l_quantity = l_quantity + 1 WHERE l_partkey % 10 = 0</query>
 
-    <!-- upd_one_file: the same shape of mutation confined to one of the 84 monthly
-         partitions, so only that partition's data file is rewritten. The delta
-         against upd_every_file is how much of the cost is the rewrite itself rather
-         than mutation planning and the commit. -->
+    <!-- upd_one_file: the same mutation confined to one of the 84 monthly partitions, so only that partition's data file is rewritten. -->
     <query>
         ALTER TABLE {database}.mut_upd_part UPDATE l_quantity = l_quantity + 1
         WHERE l_shipdate &gt;= toDate('1995-06-01') AND l_shipdate &lt; toDate('1995-07-01') AND l_partkey % 10 = 0
     </query>
 
-    <!-- del_every_file: a `DELETE` is merge-on-read, it writes position deletes
-         instead of rewriting data, so the first run creates the delete files for 10%
-         of the rows and every later run finds nothing left to delete. What is
-         measured from the second run on is therefore the steady state: mutation
-         planning plus a full scan of the table with the delete files applied, over an
-         already-deleted slice. -->
+    <!-- del_every_file: `DELETE` is merge-on-read, so the first run writes the delete files and later runs measure planning plus a full scan with them applied. -->
     <query>ALTER TABLE {database}.mut_del DELETE WHERE l_suppkey % 10 = 0</query>
 
-    <!-- del_one_file: the same delete restricted to a single monthly partition, so
-         partition pruning keeps the scan to one data file. -->
+    <!-- del_one_file: the same delete restricted to one monthly partition, so pruning keeps the scan to one data file. -->
     <query>
         ALTER TABLE {database}.mut_del_part DELETE
         WHERE l_shipdate &gt;= toDate('1996-03-01') AND l_shipdate &lt; toDate('1996-04-01') AND l_suppkey % 10 = 0
     </query>
 
-    <!-- tf_*: the same 4M rows as insert_lineitem, partitioned four different ways.
-         `bucket[8]` vs `truncate[250000]` is the transform at equal cardinality,
-         `month` (84) vs `identity` (3) is the cardinality at equal transform cost. -->
+    <!-- tf_*: the same 4M rows as insert_lineitem, partitioned four different ways. -->
     <query>
         INSERT INTO {database}.tf_month SELECT * FROM tpch10.lineitem LIMIT 4000000
         SETTINGS max_threads = 1, max_insert_threads = 1,
@@ -754,10 +646,7 @@
                  min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
     </query>
 
-    <!-- ins_small_files: 20 data files in one commit. Both the per-file row cap and
-         the block size have to come down, because the writer only rolls over on a
-         chunk boundary; the metric is manifest-entry fan-out on the commit path
-         rather than Parquet encoding. -->
+    <!-- ins_small_files: 20 data files in one commit; the block size has to come down with the row cap, because the writer only rolls over on a chunk boundary. -->
     <query>
         INSERT INTO {database}.ins_small_files SELECT * FROM tpch10.lineitem LIMIT 2000000
         SETTINGS max_threads = 1, max_insert_threads = 1, max_block_size = 100000,
@@ -765,10 +654,7 @@
                  iceberg_insert_max_rows_in_data_file = 100000
     </query>
 
-    <!-- ins_parallel: the realistic insert path. The source stays single-threaded so
-         the row set is identical on both servers; only the write side fans out, which
-         is what is being measured against insert_lineitem. The data-file count is then
-         whatever the parallel sink produces, so this query is noisier than the rest. -->
+    <!-- ins_parallel: single-threaded source so the row set matches across servers, parallel sink; the data-file count varies, so this one is noisier. -->
     <query>
         INSERT INTO {database}.ins_parallel SELECT * FROM tpch10.lineitem LIMIT 4000000
         SETTINGS max_threads = 1, max_insert_threads = 8,
@@ -782,9 +668,7 @@
                  min_insert_block_size_rows = 4000000, min_insert_block_size_bytes = 0
     </query>
 
-    <!-- commit_shallow / commit_deep: identical 100-row commits, one onto an empty
-         table and one onto 32 existing snapshots and manifests. commit_shallow is
-         also the baseline for the meta_* queries below. -->
+    <!-- commit_shallow / commit_deep: identical 100-row commits onto an empty table and onto 32 snapshots; commit_shallow is also the meta_* baseline. -->
     <query>
         INSERT INTO {database}.commit_shallow SELECT * FROM tpch10.lineitem LIMIT 100
         SETTINGS max_threads = 1, max_insert_threads = 1,
@@ -825,9 +709,7 @@
                  min_insert_block_size_rows = 500000, min_insert_block_size_bytes = 0
     </query>
 
-    <!-- meta_*: the same 100-row commit as commit_shallow, with one metadata knob
-         changed each time. Against commit_shallow they price the version hint, the
-         gzipped `.metadata.json` and the full paths written into the manifests. -->
+    <!-- meta_*: the same 100-row commit as commit_shallow, with one metadata knob changed each time. -->
     <query>
         INSERT INTO {database}.meta_hint SELECT * FROM tpch10.lineitem LIMIT 100
         SETTINGS max_threads = 1, max_insert_threads = 1,
@@ -844,33 +726,22 @@
                  min_insert_block_size_rows = 100, min_insert_block_size_bytes = 0, write_full_path_in_iceberg_metadata = 1
     </query>
 
-    <!-- maint_compact: data compaction. Rewrites the 32 seeded data files into few on
-         the first run; afterwards `getPlan` leaves `need_optimize` false and the query
-         measures planning over an already-compacted table. Requires format version 2,
-         which is the default (`iceberg_format_version`). -->
+    <!-- maint_compact: rewrites the 32 seeded data files on the first run, then measures planning over an already-compacted table. -->
     <query>OPTIMIZE TABLE {database}.maint_compact SETTINGS allow_experimental_iceberg_compaction = 1</query>
 
-    <!-- maint_manifest: manifest-only consolidation. The threshold is lowered so the
-         32 seeded manifests are above it; once consolidated, `compactIcebergManifests`
-         returns early instead of throwing. -->
+    <!-- maint_manifest: the threshold is lowered so the 32 seeded manifests are above it; once consolidated `compactIcebergManifests` returns early. -->
     <query>
         OPTIMIZE TABLE {database}.maint_manifest MANIFEST
         SETTINGS allow_experimental_iceberg_compaction = 1, iceberg_manifest_min_count_to_compact = 8
     </query>
 
-    <!-- maint_expire: drop all but the newest snapshot, deleting the manifests,
-         manifest lists and data files that only they referenced. Later runs find
-         nothing to expire and return. -->
+    <!-- maint_expire: drop all but the newest snapshot; later runs find nothing to expire and return. -->
     <query>
         ALTER TABLE {database}.maint_expire EXECUTE expire_snapshots(retain_last = 1)
         SETTINGS allow_experimental_expire_snapshots = 1
     </query>
 
-    <!-- maint_orphan: this one is genuinely constant per run. With the default
-         `iceberg_orphan_files_older_than_seconds` of three days nothing in a
-         freshly-written table is old enough to delete, so every run pays the full
-         cost and only that cost: list the table directory and collect the reachable
-         file set across all snapshots. -->
+    <!-- maint_orphan: constant per run, since with the default three-day threshold nothing is old enough to delete and every run pays the full listing and reachability walk. -->
     <query>
         ALTER TABLE {database}.maint_orphan EXECUTE remove_orphan_files()
         SETTINGS allow_iceberg_remove_orphan_files = 1
