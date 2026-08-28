@@ -1,13 +1,14 @@
 import csv
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List, Tuple
 
 from ci.jobs.scripts.clickhouse_service import ClickHouseService
 from ci.jobs.scripts.docker_image import DockerImage
-from ci.jobs.scripts.log_parser import FuzzerLogParser
+from ci.jobs.scripts.log_parser import SANITIZER_OOM_REPORT_PATTERN, FuzzerLogParser
 from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.utils import Shell, Utils
@@ -456,7 +457,22 @@ def run_stress_test(upgrade_check: bool = False) -> None:
                 and fallback_result is not None
                 and fallback_result[0] != FuzzerLogParser.UNKNOWN_ERROR
             )
-            if expected_only:
+            # OOM is allowed in stress tests outright - `is_oom` above already passes the
+            # run for a report in a current log or dmesg. One found only via
+            # `parse_failure(allow_expected_only=True)` can equally be a report that
+            # rotated out of the current log, which `is_oom`'s own scan does not cover.
+            # `server_died` says only that the process crashed, not why, so this is
+            # checked independently of the `not server_died` guard above.
+            expected_only_oom = (
+                definitive_result is None
+                and fallback_result is not None
+                and fallback_result[0] != FuzzerLogParser.UNKNOWN_ERROR
+                and re.search(SANITIZER_OOM_REPORT_PATTERN, fallback_result[1])
+            )
+            if expected_only_oom:
+                is_oom = True
+                print(f"Only a sanitizer OOM report in the server logs: {fallback_result[0]}")
+            elif expected_only:
                 print(
                     f"Only expected messages in the server logs: {fallback_result[0]}"
                 )
