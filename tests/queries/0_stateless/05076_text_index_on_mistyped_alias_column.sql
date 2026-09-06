@@ -191,3 +191,26 @@ ALTER TABLE db_05076_declared.t_declared MODIFY COLUMN a Array(String) ALIAS map
 SELECT count() FROM system.data_skipping_indices WHERE database = 'db_05076_declared' AND table = 't_declared';
 
 DROP DATABASE db_05076_declared;
+
+-- The type an ALIAS expression produces is the other half of what makes it mistyped, and an index
+-- expression can normalise a change to it away: `lower()` maps `FixedString` back to `String`, so
+-- retyping the column the ALIAS reads leaves the index declaration, the expanded expression, the
+-- resolved types and the ALIAS's own declared type all equal while the CAST it is read through moves.
+SET allow_deprecated_database_ordinary = 1;
+DROP DATABASE IF EXISTS db_05076_norm;
+CREATE DATABASE db_05076_norm ENGINE = Ordinary;
+
+ATTACH TABLE db_05076_norm.t_norm
+(
+    m Map(String, String),
+    a Array(FixedString(3)) ALIAS mapValues(m),
+    INDEX fts_norm arrayMap(x -> lower(x), a) TYPE text(tokenizer = array)
+) ENGINE = MergeTree ORDER BY tuple();
+
+ALTER TABLE db_05076_norm.t_norm ADD COLUMN v UInt8;
+SELECT count() FROM system.columns WHERE database = 'db_05076_norm' AND table = 't_norm' AND name = 'v';
+
+ALTER TABLE db_05076_norm.t_norm
+    MODIFY COLUMN m Map(String, FixedString(2)); -- { serverError BAD_ARGUMENTS }
+
+DROP DATABASE db_05076_norm;
