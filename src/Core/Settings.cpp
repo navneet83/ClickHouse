@@ -6910,6 +6910,14 @@ Rewrite `length(arrayFilter(func, arr))` to `arrayCount(func, arr)`. `arrayFilte
 Rewrite `has` functions to `IN` when the first argument is a constant array. For example, `has([1, 2, 3], x)` can be rewritten to `x IN [1, 2, 3]` for better performance with constant arrays
 )", 0, \
         {"26.6", false, true, "New setting"}) \
+    DECLARE(Bool, optimize_rewrite_has_chain_to_has_any, true, R"(
+Merge `has`, `hasAll` and `notHas` calls with one constant element on the same array in `WHERE`, `PREWHERE` or `JOIN ON` into a single `hasAny`. `NOT has(arr, 'a') AND NOT hasAll(arr, ['b'])` becomes `NOT hasAny(arr, ['a', 'b'])`, and `has(arr, 'a') OR hasAll(arr, ['b'])` becomes `hasAny(arr, ['a', 'b'])`. A text index answers one `hasAny` once per block instead of once per call.
+)", 0, \
+        {"26.10", false, true, "New setting"}) \
+    DECLARE(UInt64, optimize_min_has_chain_length, 4, R"(
+The minimum number of `has` or `hasAll` calls on one array that `optimize_rewrite_has_chain_to_has_any` merges into a `hasAny`. Without a text index, `hasAny` looks the elements up in a hash set only from four elements on, and with fewer it is slower than the separate `has` calls, so shorter chains are left as written. Values below 2 are treated as 2.
+)", 0, \
+        {"26.10", 0, 4, "New setting"}) \
     DECLARE(Bool, optimize_dictget_tuple_element, true, R"(
 Rewrite `tupleElement(dictGet('dict', ('a', 'b', 'c'), key), 2)` into `dictGet('dict', 'b', key)` to avoid fetching unnecessary dictionary attributes. Supports positional (`.1`, `.2`, ...) and named (`.b`) access, and also applies to `dictGetOrDefault` when the default argument is a constant tuple or a `tuple(...)` of constants.
 )", 0, \
