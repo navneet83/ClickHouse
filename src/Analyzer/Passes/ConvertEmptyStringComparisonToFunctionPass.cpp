@@ -61,7 +61,8 @@ bool keysDeclareComparisonWithEmptyString(const StorageInMemoryMetadata & metada
     return false;
 }
 
-/// Whether any key, skip index or projection key of the table compares with `''`.
+/// Whether any key, skip index or projection of the table compares with `''`. A projection is checked as a whole,
+/// since its filter and its own skip indexes are matched by their written text just like its keys.
 /// Skip index expressions are stored with ALIAS columns already expanded, so aliases need no separate check.
 bool declaresComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
 {
@@ -73,7 +74,7 @@ bool declaresComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
             return true;
 
     for (const auto & projection : metadata.getProjections())
-        if (projection.metadata && keysDeclareComparisonWithEmptyString(*projection.metadata))
+        if (projection.definition_ast && comparesWithEmptyString(projection.definition_ast))
             return true;
 
     return false;

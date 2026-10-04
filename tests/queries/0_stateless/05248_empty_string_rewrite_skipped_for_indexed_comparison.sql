@@ -46,6 +46,12 @@ INSERT INTO tab VALUES (''), ('x'), ('y'), ('z');
 SELECT count() FROM tab WHERE a = 'abc' SETTINGS force_data_skipping_indices = 'idx';
 DROP TABLE tab;
 
+-- A projection's own skip index is matched by its written text too.
+CREATE TABLE tab (id UInt32, s String, PROJECTION p INDEX if(s = '', 'abc', s) TYPE basic) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2;
+INSERT INTO tab VALUES (1, ''), (2, 'x'), (3, 'y'), (4, ''), (5, 'z');
+SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc' SETTINGS force_optimize_projection_name = 'p';
+DROP TABLE tab;
+
 -- The comparison may be written as `!=` or with the literal on the left.
 CREATE TABLE tab (s String, INDEX idx ('' != s) TYPE minmax) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
 INSERT INTO tab VALUES (''), ('x'), ('y'), ('z');
