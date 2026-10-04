@@ -30,12 +30,14 @@ namespace Setting
 namespace
 {
 
+/// The literal `''`.
 bool isEmptyStringLiteral(const ASTPtr & ast)
 {
     const auto * literal = ast->as<ASTLiteral>();
     return literal && literal->value.getType() == Field::Types::String && literal->value.safeGet<String>().empty();
 }
 
+/// Whether the expression contains `x = ''` or `x != ''` anywhere, with the literal on either side.
 bool comparesWithEmptyString(const ASTPtr & ast)
 {
     if (const auto * function = ast->as<ASTFunction>();
@@ -50,6 +52,7 @@ bool comparesWithEmptyString(const ASTPtr & ast)
     return false;
 }
 
+/// Whether the partition, sorting, primary or sampling key compares with `''`.
 bool keysDeclareComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
 {
     for (const auto * key : {&metadata.getPartitionKey(), &metadata.getSortingKey(), &metadata.getPrimaryKey(), &metadata.getSamplingKey()})
@@ -58,7 +61,8 @@ bool keysDeclareComparisonWithEmptyString(const StorageInMemoryMetadata & metada
     return false;
 }
 
-/// A key or skip index is matched to a query by its declared spelling, so a comparison with `''` in it must stay as written.
+/// Whether any key, skip index or projection key of the table compares with `''`.
+/// Skip index expressions are stored with ALIAS columns already expanded, so aliases need no separate check.
 bool declaresComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
 {
     if (keysDeclareComparisonWithEmptyString(metadata))
@@ -75,6 +79,8 @@ bool declaresComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
     return false;
 }
 
+/// Walks the query tree, including subqueries, and sets `found` if any table it reads has a key or skip index
+/// that compares with `''`. Such a table needs the comparison as written, so the rewrite is skipped for the whole query.
 class FindTableWithIndexedEmptyStringComparisonVisitor : public InDepthQueryTreeVisitorWithContext<FindTableWithIndexedEmptyStringComparisonVisitor>
 {
 public:
@@ -93,8 +99,10 @@ public:
         if (!storage)
             return;
 
-        /// These wrappers forward `read` to a nested table with this query, so its indexes are the ones that matter.
-        /// A `Distributed`, `Merge` or `View` table reads its tables with the already rewritten query and is not followed.
+        /// A lazily loaded table, an Alias, a materialized view and a Buffer forward the read to another table,
+        /// so look at that table's indexes. The loop is bounded in case the wrappers form a cycle.
+        /// Distributed, Merge and View are not followed: they run the already rewritten query on their tables,
+        /// so an index behind them cannot be helped here.
         for (size_t i = 0; storage && i < 16; ++i)
         {
             if (const auto * proxy = dynamic_cast<const StorageProxy *>(storage.get()))
@@ -122,7 +130,12 @@ class ConvertEmptyStringComparisonToFunctionVisitor
 {
 public:
     using Base = InDepthQueryTreeVisitorWithContext<ConvertEmptyStringComparisonToFunctionVisitor>;
-    using Base::Base;
+
+    ConvertEmptyStringComparisonToFunctionVisitor(ContextPtr context_, QueryTreeNodePtr root_)
+        : Base(std::move(context_))
+        , root(std::move(root_))
+    {
+    }
 
     void enterImpl(QueryTreeNodePtr & node)
     {
@@ -170,6 +183,17 @@ public:
         if (!expr_type || !isStringOrFixedString(expr_type))
             return;
 
+        /// Look at the tables only once, and only when there is something to rewrite: most queries never get here.
+        if (!tables_checked)
+        {
+            FindTableWithIndexedEmptyStringComparisonVisitor find_indexed_comparison(getContext());
+            find_indexed_comparison.visit(root);
+            keep_comparisons_as_written = find_indexed_comparison.found;
+            tables_checked = true;
+        }
+        if (keep_comparisons_as_written)
+            return;
+
         const String replacement_func = (func_name == "equals") ? "empty" : "notEmpty";
 
         auto replacement_node = std::make_shared<FunctionNode>(replacement_func);
@@ -179,18 +203,18 @@ public:
 
         node = std::move(replacement_node);
     }
+
+private:
+    QueryTreeNodePtr root;
+    bool tables_checked = false;
+    bool keep_comparisons_as_written = false;
 };
 
 }
 
 void ConvertEmptyStringComparisonToFunctionPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context)
 {
-    FindTableWithIndexedEmptyStringComparisonVisitor find_indexed_comparison(context);
-    find_indexed_comparison.visit(query_tree_node);
-    if (find_indexed_comparison.found)
-        return;
-
-    ConvertEmptyStringComparisonToFunctionVisitor visitor(std::move(context));
+    ConvertEmptyStringComparisonToFunctionVisitor visitor(std::move(context), query_tree_node);
     visitor.visit(query_tree_node);
 }
 
