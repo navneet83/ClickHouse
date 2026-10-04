@@ -11,16 +11,19 @@ DROP TABLE IF EXISTS mv_buf;
 DROP TABLE IF EXISTS buf;
 DROP TABLE IF EXISTS plain;
 
-CREATE TABLE tab (s String, INDEX idx if(s = '', 'abc', s) TYPE minmax) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
-INSERT INTO tab VALUES (''), ('x'), ('y'), ('z');
+CREATE TABLE tab (s String, t String, INDEX idx if(s = '', 'abc', s) TYPE minmax) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
+INSERT INTO tab VALUES ('', ''), ('x', 'x'), ('y', ''), ('z', 'z');
 SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc' SETTINGS force_data_skipping_indices = 'idx';
 SELECT trimLeft(explain) FROM (EXPLAIN indexes = 1 SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc') WHERE explain LIKE '%Name: idx%' OR explain LIKE '%Granules:%';
 SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc') WHERE explain LIKE '%function_name: empty%';
--- The table may sit in a subquery, or next to a table without such an index.
+-- The table may sit in a subquery.
 SELECT count() FROM system.one WHERE 1 IN (SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc' SETTINGS force_data_skipping_indices = 'idx');
+-- Only the compared column of that table is kept as written: another column of it, and a column of another table
+-- in the same query, are still rewritten.
+SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc' AND if(t = '', 'abc', t) = 'abc') WHERE explain LIKE '%function_name: empty%';
 CREATE TABLE plain (s String) ENGINE = MergeTree ORDER BY tuple();
 INSERT INTO plain VALUES (''), ('x');
-SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM plain, tab WHERE if(plain.s = '', 'abc', plain.s) = 'abc') WHERE explain LIKE '%function_name: empty%';
+SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM plain, tab WHERE if(plain.s = '', 'abc', plain.s) = 'abc' AND if(tab.s = '', 'abc', tab.s) = 'abc') WHERE explain LIKE '%function_name: empty%';
 -- The index of the target table is seen through a materialized view, a `Buffer` table and a chain of both.
 CREATE TABLE dst (s String, INDEX idx if(s = '', 'abc', s) TYPE minmax) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
 CREATE MATERIALIZED VIEW mv TO dst AS SELECT s FROM plain;

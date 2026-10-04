@@ -9,8 +9,9 @@ namespace DB
 /// and `column != ''` or `'' != column` to `notEmpty(column)`.
 ///
 /// Keys and skip indexes match a query by the exact text of their expression, so rewriting `s = ''`
-/// to `empty(s)` would break them. To avoid this, the rewrite is skipped when a key or skip index of
-/// a table in the query checks for an empty string, for example `INDEX idx if(s = '', 'abc', s) TYPE minmax`.
+/// to `empty(s)` would break them. To avoid this, a comparison is left as written when its column belongs
+/// to a table whose key or skip index checks that column for an empty string, for example
+/// `INDEX idx if(s = '', 'abc', s) TYPE minmax`. Other columns and other tables are still rewritten.
 class ConvertEmptyStringComparisonToFunctionPass final : public IQueryTreePass
 {
 public:

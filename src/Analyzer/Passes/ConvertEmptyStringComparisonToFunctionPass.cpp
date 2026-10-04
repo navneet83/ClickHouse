@@ -11,6 +11,7 @@
 #include <DataTypes/DataTypeString.h>
 #include <Functions/FunctionFactory.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Storages/StorageAlias.h>
 #include <Storages/StorageBuffer.h>
@@ -37,94 +38,90 @@ bool isEmptyStringLiteral(const ASTPtr & ast)
     return literal && literal->value.getType() == Field::Types::String && literal->value.safeGet<String>().empty();
 }
 
-/// Whether the expression contains `x = ''` or `x != ''` anywhere, with the literal on either side.
-bool comparesWithEmptyString(const ASTPtr & ast)
+void collectIdentifiers(const ASTPtr & ast, NameSet & names)
+{
+    if (const auto * identifier = ast->as<ASTIdentifier>())
+        names.insert(identifier->shortName());
+    for (const auto & child : ast->children)
+        collectIdentifiers(child, names);
+}
+
+/// Collects the columns that the expression compares with `''` anywhere, as `x = ''` or `x != ''` with the literal
+/// on either side. For `if(s = '', 'abc', s)` that is `s`.
+void collectColumnsComparedWithEmptyString(const ASTPtr & ast, NameSet & columns)
 {
     if (const auto * function = ast->as<ASTFunction>();
         function && (function->name == "equals" || function->name == "notEquals") && function->arguments
-        && function->arguments->children.size() == 2
-        && (isEmptyStringLiteral(function->arguments->children[0]) || isEmptyStringLiteral(function->arguments->children[1])))
-        return true;
+        && function->arguments->children.size() == 2)
+    {
+        const auto & args = function->arguments->children;
+        if (isEmptyStringLiteral(args[0]))
+            collectIdentifiers(args[1], columns);
+        else if (isEmptyStringLiteral(args[1]))
+            collectIdentifiers(args[0], columns);
+    }
 
     for (const auto & child : ast->children)
-        if (comparesWithEmptyString(child))
-            return true;
-    return false;
+        collectColumnsComparedWithEmptyString(child, columns);
 }
 
-/// Whether the partition, sorting, primary or sampling key compares with `''`.
-bool keysDeclareComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
-{
-    for (const auto * key : {&metadata.getPartitionKey(), &metadata.getSortingKey(), &metadata.getPrimaryKey(), &metadata.getSamplingKey()})
-        if (key->expression_list_ast && comparesWithEmptyString(key->expression_list_ast))
-            return true;
-    return false;
-}
-
-/// Whether any key, skip index or projection of the table compares with `''`. A projection is checked as a whole,
-/// since its filter and its own skip indexes are matched by their written text just like its keys.
+/// The columns that a key, skip index or projection of the table compares with `''`. A projection is checked as
+/// a whole, since its filter and its own skip indexes are matched by their written text just like its keys.
 /// Skip index expressions are stored with ALIAS columns already expanded, so aliases need no separate check.
-bool declaresComparisonWithEmptyString(const StorageInMemoryMetadata & metadata)
+NameSet columnsComparedWithEmptyStringInDeclarations(const StorageInMemoryMetadata & metadata)
 {
-    if (keysDeclareComparisonWithEmptyString(metadata))
-        return true;
+    NameSet columns;
+    for (const auto * key : {&metadata.getPartitionKey(), &metadata.getSortingKey(), &metadata.getPrimaryKey(), &metadata.getSamplingKey()})
+        if (key->expression_list_ast)
+            collectColumnsComparedWithEmptyString(key->expression_list_ast, columns);
 
     for (const auto & index : metadata.getSecondaryIndices())
-        if (index.expression_list_ast && comparesWithEmptyString(index.expression_list_ast))
-            return true;
+        if (index.expression_list_ast)
+            collectColumnsComparedWithEmptyString(index.expression_list_ast, columns);
 
     for (const auto & projection : metadata.getProjections())
-        if (projection.definition_ast && comparesWithEmptyString(projection.definition_ast))
-            return true;
+        if (projection.definition_ast)
+            collectColumnsComparedWithEmptyString(projection.definition_ast, columns);
 
-    return false;
+    return columns;
 }
 
-/// Walks the query tree, including subqueries, and sets `found` if any table it reads has a key or skip index
-/// that compares with `''`. Such a table needs the comparison as written, so the rewrite is skipped for the whole query.
-class FindTableWithIndexedEmptyStringComparisonVisitor : public InDepthQueryTreeVisitorWithContext<FindTableWithIndexedEmptyStringComparisonVisitor>
+/// The table a column is read from, through the wrappers that forward the read to another table: a lazily loaded
+/// table, an Alias, a materialized view and a Buffer. The loop is bounded in case the wrappers form a cycle.
+/// Distributed, Merge and View are not followed: they run the already rewritten query on their tables,
+/// so an index behind them cannot be helped here.
+StoragePtr getUnderlyingStorage(const QueryTreeNodePtr & source)
 {
-public:
-    using Base = InDepthQueryTreeVisitorWithContext<FindTableWithIndexedEmptyStringComparisonVisitor>;
-    using Base::Base;
+    StoragePtr storage;
+    if (const auto * table_node = source->as<TableNode>())
+        storage = table_node->getStorage();
+    else if (const auto * table_function_node = source->as<TableFunctionNode>())
+        storage = table_function_node->getStorage();
 
-    bool found = false;
-
-    void enterImpl(QueryTreeNodePtr & node)
+    for (size_t i = 0; storage && i < 16; ++i)
     {
-        StoragePtr storage;
-        if (const auto * table_node = node->as<TableNode>())
-            storage = table_node->getStorage();
-        else if (const auto * table_function_node = node->as<TableFunctionNode>())
-            storage = table_function_node->getStorage();
-        if (!storage)
-            return;
-
-        /// A lazily loaded table, an Alias, a materialized view and a Buffer forward the read to another table,
-        /// so look at that table's indexes. The loop is bounded in case the wrappers form a cycle.
-        /// Distributed, Merge and View are not followed: they run the already rewritten query on their tables,
-        /// so an index behind them cannot be helped here.
-        for (size_t i = 0; storage && i < 16; ++i)
-        {
-            if (const auto * proxy = dynamic_cast<const StorageProxy *>(storage.get()))
-                storage = proxy->getNested();
-            else if (const auto * alias = storage->as<StorageAlias>())
-                storage = alias->tryGetTargetTable();
-            else if (const auto * materialized_view = storage->as<StorageMaterializedView>())
-                storage = materialized_view->tryGetTargetTable();
-            else if (const auto * buffer = storage->as<StorageBuffer>())
-                storage = buffer->getDestinationTable();
-            else
-                break;
-        }
-        if (!storage)
-            return;
-
-        const auto metadata = storage->getInMemoryMetadataPtr(getContext(), false);
-        if (declaresComparisonWithEmptyString(*metadata))
-            found = true;
+        if (const auto * proxy = dynamic_cast<const StorageProxy *>(storage.get()))
+            storage = proxy->getNested();
+        else if (const auto * alias = storage->as<StorageAlias>())
+            storage = alias->tryGetTargetTable();
+        else if (const auto * materialized_view = storage->as<StorageMaterializedView>())
+            storage = materialized_view->tryGetTargetTable();
+        else if (const auto * buffer = storage->as<StorageBuffer>())
+            storage = buffer->getDestinationTable();
+        else
+            break;
     }
-};
+    return storage;
+}
+
+void collectColumnNodes(const QueryTreeNodePtr & node, std::vector<const ColumnNode *> & columns)
+{
+    if (const auto * column_node = node->as<ColumnNode>())
+        columns.push_back(column_node);
+    for (const auto & child : node->getChildren())
+        if (child)
+            collectColumnNodes(child, columns);
+}
 
 class ConvertEmptyStringComparisonToFunctionVisitor
     : public InDepthQueryTreeVisitorWithContext<ConvertEmptyStringComparisonToFunctionVisitor>
@@ -132,11 +129,7 @@ class ConvertEmptyStringComparisonToFunctionVisitor
 public:
     using Base = InDepthQueryTreeVisitorWithContext<ConvertEmptyStringComparisonToFunctionVisitor>;
 
-    ConvertEmptyStringComparisonToFunctionVisitor(ContextPtr context_, QueryTreeNodePtr root_)
-        : Base(std::move(context_))
-        , root(std::move(root_))
-    {
-    }
+    using Base::Base;
 
     void enterImpl(QueryTreeNodePtr & node)
     {
@@ -184,15 +177,7 @@ public:
         if (!expr_type || !isStringOrFixedString(expr_type))
             return;
 
-        /// Look at the tables only once, and only when there is something to rewrite: most queries never get here.
-        if (!tables_checked)
-        {
-            FindTableWithIndexedEmptyStringComparisonVisitor find_indexed_comparison(getContext());
-            find_indexed_comparison.visit(root);
-            keep_comparisons_as_written = find_indexed_comparison.found;
-            tables_checked = true;
-        }
-        if (keep_comparisons_as_written)
+        if (mustStayAsWritten(expr_node))
             return;
 
         const String replacement_func = (func_name == "equals") ? "empty" : "notEmpty";
@@ -206,16 +191,45 @@ public:
     }
 
 private:
-    QueryTreeNodePtr root;
-    bool tables_checked = false;
-    bool keep_comparisons_as_written = false;
+    /// Whether a column of the expression belongs to a table whose key, skip index or projection compares that
+    /// column with `''`. Such a comparison must keep its written text, or the index no longer matches the query.
+    bool mustStayAsWritten(const QueryTreeNodePtr & expr)
+    {
+        std::vector<const ColumnNode *> columns;
+        collectColumnNodes(expr, columns);
+
+        for (const auto * column_node : columns)
+        {
+            auto source = column_node->getColumnSourceOrNull();
+            if (!source)
+                continue;
+
+            auto storage = getUnderlyingStorage(source);
+            if (!storage)
+                continue;
+
+            auto [it, inserted] = columns_by_storage.try_emplace(storage.get());
+            if (inserted)
+            {
+                auto metadata = storage->getInMemoryMetadataPtr(getContext(), false);
+                it->second = columnsComparedWithEmptyStringInDeclarations(*metadata);
+            }
+
+            if (it->second.contains(column_node->getColumnName()))
+                return true;
+        }
+        return false;
+    }
+
+    /// Looked up once per table and query: most queries never reach this.
+    std::unordered_map<const IStorage *, NameSet> columns_by_storage;
 };
 
 }
 
 void ConvertEmptyStringComparisonToFunctionPass::run(QueryTreeNodePtr & query_tree_node, ContextPtr context)
 {
-    ConvertEmptyStringComparisonToFunctionVisitor visitor(std::move(context), query_tree_node);
+    ConvertEmptyStringComparisonToFunctionVisitor visitor(std::move(context));
     visitor.visit(query_tree_node);
 }
 
