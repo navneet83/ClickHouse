@@ -3,6 +3,7 @@
 SET enable_analyzer = 1;
 SET explain_query_plan_default = 'legacy';
 SET optimize_empty_string_comparisons = 1;
+SET use_skip_indexes_on_data_read = 0;
 
 DROP TABLE IF EXISTS tab;
 DROP TABLE IF EXISTS dst;
@@ -66,6 +67,19 @@ CREATE TABLE tab (id UInt32, t Tuple(s String), s String, INDEX idx if(t.s = '',
 INSERT INTO tab SELECT number, tuple(if(number < 2, '', 'x')), if(number < 2, '', 'y') FROM numbers(4);
 SELECT count() FROM tab WHERE if(t.s = '', 'abc', t.s) = 'abc' SETTINGS force_data_skipping_indices = 'idx';
 SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM tab WHERE if(t.s = '', 'abc', t.s) = 'abc' AND if(s = '', 'abc', s) = 'abc') WHERE explain LIKE '%function_name: empty%';
+DROP TABLE tab;
+
+-- A comparison inside a lambda counts for the arrays the lambda runs over: the index on `arr` keeps `x = ''` as written,
+-- the same lambda over another array is still rewritten.
+CREATE TABLE tab (id UInt32, arr Array(String), other Array(String), INDEX idx arrayMap(x -> if(x = '', 'e', x), arr) TYPE bloom_filter(0.01)) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2;
+INSERT INTO tab SELECT number, [if(number < 2, '', 'x'), 'y'], [''] FROM numbers(4);
+SELECT count() FROM tab WHERE has(arrayMap(x -> if(x = '', 'e', x), arr), 'e') SETTINGS force_data_skipping_indices = 'idx';
+SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM tab WHERE has(arrayMap(x -> if(x = '', 'e', x), arr), 'e') AND has(arrayMap(x -> if(x = '', 'e', x), other), 'e')) WHERE explain LIKE '%function_name: empty%';
+DROP TABLE tab;
+-- Through nested lambdas as well.
+CREATE TABLE tab (id UInt32, nested Array(Array(String)), INDEX idx arrayCount(x -> arrayCount(y -> y = '', x) > 0, nested) TYPE minmax) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2;
+INSERT INTO tab SELECT number, [[if(number < 2, '', 'x'), 'y']] FROM numbers(4);
+SELECT count() FROM tab WHERE arrayCount(x -> arrayCount(y -> y = '', x) > 0, nested) > 0 SETTINGS force_data_skipping_indices = 'idx';
 DROP TABLE tab;
 
 -- A query over other tables is still rewritten, also when the setting is enabled only on the query.

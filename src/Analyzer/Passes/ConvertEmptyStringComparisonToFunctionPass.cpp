@@ -4,6 +4,7 @@
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/FunctionNode.h>
 #include <Analyzer/InDepthQueryTreeVisitor.h>
+#include <Analyzer/LambdaNode.h>
 #include <Analyzer/TableFunctionNode.h>
 #include <Analyzer/TableNode.h>
 #include <Analyzer/Utils.h>
@@ -47,44 +48,100 @@ void collectIdentifiers(const ASTPtr & ast, NameSet & names)
         collectIdentifiers(child, names);
 }
 
-/// Collects the columns that the expression compares with `''` anywhere, as `x = ''` or `x != ''` with the literal
-/// on either side. For `if(s = '', 'abc', s)` that is `s`.
-void collectColumnsComparedWithEmptyString(const ASTPtr & ast, NameSet & columns)
+/// What the keys, skip indexes and projections of a table compare with `''`: columns directly, and arrays whose
+/// elements a lambda compares, as in `arrayMap(x -> if(x = '', 'e', x), arr)`.
+struct DeclaredComparisons
 {
-    if (const auto * function = ast->as<ASTFunction>();
-        function && (function->name == "equals" || function->name == "notEquals") && function->arguments
+    NameSet columns;
+    NameSet arrays;
+};
+
+/// Collects into `out.columns` the names compared with `''` anywhere in `ast`, as `x = ''` or `x != ''` with the literal
+/// on either side. For `if(s = '', 'abc', s)` that is `s`. A name that is a lambda parameter in scope is returned
+/// instead, and the call that runs the lambda attributes it to the arrays the lambda runs over.
+NameSet collectDeclaredComparisons(const ASTPtr & ast, const NameSet & params, DeclaredComparisons & out)
+{
+    NameSet compared_params;
+    const auto * function = ast->as<ASTFunction>();
+
+    if (function && (function->name == "equals" || function->name == "notEquals") && function->arguments
         && function->arguments->children.size() == 2)
     {
         const auto & args = function->arguments->children;
+        NameSet names;
         if (isEmptyStringLiteral(args[0]))
-            collectIdentifiers(args[1], columns);
+            collectIdentifiers(args[1], names);
         else if (isEmptyStringLiteral(args[1]))
-            collectIdentifiers(args[0], columns);
+            collectIdentifiers(args[0], names);
+
+        for (const auto & name : names)
+            (params.contains(name) ? compared_params : out.columns).insert(name);
+    }
+
+    if (function && function->arguments)
+    {
+        for (const auto & argument : function->arguments->children)
+        {
+            const auto * lambda = argument->as<ASTFunction>();
+            if (!lambda || lambda->name != "lambda" || !lambda->arguments || lambda->arguments->children.size() != 2)
+            {
+                compared_params.merge(collectDeclaredComparisons(argument, params, out));
+                continue;
+            }
+
+            NameSet lambda_params;
+            collectIdentifiers(lambda->arguments->children[0], lambda_params);
+            NameSet in_scope = params;
+            in_scope.insert(lambda_params.begin(), lambda_params.end());
+
+            bool compares_own_param = false;
+            for (const auto & name : collectDeclaredComparisons(lambda->arguments->children[1], in_scope, out))
+            {
+                if (lambda_params.contains(name))
+                    compares_own_param = true;
+                else
+                    compared_params.insert(name);
+            }
+
+            /// An array that is itself a parameter of an enclosing lambda is reported upwards instead, so that
+            /// `arrayCount(x -> arrayCount(y -> y = '', x) > 0, nested)` attributes the comparison to `nested`.
+            if (compares_own_param)
+            {
+                NameSet arrays;
+                for (const auto & other : function->arguments->children)
+                    if (other != argument)
+                        collectIdentifiers(other, arrays);
+                for (const auto & name : arrays)
+                    (params.contains(name) ? compared_params : out.arrays).insert(name);
+            }
+        }
+        return compared_params;
     }
 
     for (const auto & child : ast->children)
-        collectColumnsComparedWithEmptyString(child, columns);
+        compared_params.merge(collectDeclaredComparisons(child, params, out));
+    return compared_params;
 }
 
-/// The columns that a key, skip index or projection of the table compares with `''`. A projection is checked as
-/// a whole, since its filter and its own skip indexes are matched by their written text just like its keys.
-/// Skip index expressions are stored with ALIAS columns already expanded, so aliases need no separate check.
-NameSet columnsComparedWithEmptyStringInDeclarations(const StorageInMemoryMetadata & metadata)
+/// A projection is checked as a whole, since its filter and its own skip indexes are matched by their written text
+/// just like its keys. Skip index expressions are stored with ALIAS columns already expanded, so aliases need no
+/// separate check.
+DeclaredComparisons declaredComparisons(const StorageInMemoryMetadata & metadata)
 {
-    NameSet columns;
+    DeclaredComparisons out;
     for (const auto * key : {&metadata.getPartitionKey(), &metadata.getSortingKey(), &metadata.getPrimaryKey(), &metadata.getSamplingKey()})
         if (key->expression_list_ast)
-            collectColumnsComparedWithEmptyString(key->expression_list_ast, columns);
+            collectDeclaredComparisons(key->expression_list_ast, {}, out);
 
     for (const auto & index : metadata.getSecondaryIndices())
         if (index.expression_list_ast)
-            collectColumnsComparedWithEmptyString(index.expression_list_ast, columns);
+            collectDeclaredComparisons(index.expression_list_ast, {}, out);
 
     for (const auto & projection : metadata.getProjections())
         if (projection.definition_ast)
-            collectColumnsComparedWithEmptyString(projection.definition_ast, columns);
+            collectDeclaredComparisons(projection.definition_ast, {}, out);
 
-    return columns;
+    return out;
 }
 
 /// The table a column is read from, through the wrappers that forward the read to another table: a lazily loaded
@@ -141,6 +198,8 @@ public:
         if (!function_node)
             return;
 
+        rememberLambdaArrays(*function_node);
+
         const String & func_name = function_node->getFunctionName();
         if (func_name != "equals" && func_name != "notEquals")
             return;
@@ -192,8 +251,67 @@ public:
     }
 
 private:
+    /// The declarations of the table a column is read from, or null when it is not read from a table.
+    const DeclaredComparisons * declarationsFor(const ColumnNode & column_node)
+    {
+        auto source = column_node.getColumnSourceOrNull();
+        if (!source)
+            return nullptr;
+
+        auto storage = getUnderlyingStorage(source);
+        if (!storage)
+            return nullptr;
+
+        auto [it, inserted] = declarations_by_storage.try_emplace(storage.get());
+        if (inserted)
+        {
+            auto metadata = storage->getInMemoryMetadataPtr(getContext(), false);
+            it->second = declaredComparisons(*metadata);
+        }
+        return &it->second;
+    }
+
+    /// The arrays of every call that runs a lambda, by the lambda's arguments node. Noted on the way down, since the
+    /// call is entered before its lambda body, and read only when a parameter of that lambda is compared with `''`.
+    void rememberLambdaArrays(const FunctionNode & function)
+    {
+        const auto & arguments = function.getArguments().getNodes();
+        const LambdaNode * lambda = nullptr;
+        for (const auto & argument : arguments)
+            if (const auto * candidate = argument->as<LambdaNode>())
+                lambda = candidate;
+        if (!lambda)
+            return;
+
+        auto & arrays = arrays_by_lambda[&lambda->getArguments()];
+        for (const auto & argument : arguments)
+            if (!argument->as<LambdaNode>())
+                collectColumnNodes(argument, arrays);
+    }
+
+    /// Whether the column is an array whose elements a declaration compares with `''`: directly, or through the
+    /// arrays of its lambda when the column is itself a lambda parameter.
+    bool isDeclaredArray(const ColumnNode & column_node)
+    {
+        auto source = column_node.getColumnSourceOrNull();
+        if (!source)
+            return false;
+
+        if (auto it = arrays_by_lambda.find(source.get()); it != arrays_by_lambda.end())
+        {
+            for (const auto * array : it->second)
+                if (isDeclaredArray(*array))
+                    return true;
+            return false;
+        }
+
+        const auto * declared = declarationsFor(column_node);
+        return declared && declared->arrays.contains(column_node.getColumnName());
+    }
+
     /// Whether a column of the expression belongs to a table whose key, skip index or projection compares that
-    /// column with `''`. Such a comparison must keep its written text, or the index no longer matches the query.
+    /// column with `''`, or is the parameter of a lambda that runs over such an array. Such a comparison must keep
+    /// its written text, or the index no longer matches the query.
     bool mustStayAsWritten(const QueryTreeNodePtr & expr)
     {
         std::vector<const ColumnNode *> columns;
@@ -202,28 +320,23 @@ private:
         for (const auto * column_node : columns)
         {
             auto source = column_node->getColumnSourceOrNull();
-            if (!source)
-                continue;
-
-            auto storage = getUnderlyingStorage(source);
-            if (!storage)
-                continue;
-
-            auto [it, inserted] = columns_by_storage.try_emplace(storage.get());
-            if (inserted)
+            if (source && arrays_by_lambda.contains(source.get()))
             {
-                auto metadata = storage->getInMemoryMetadataPtr(getContext(), false);
-                it->second = columnsComparedWithEmptyStringInDeclarations(*metadata);
+                if (isDeclaredArray(*column_node))
+                    return true;
+                continue;
             }
 
-            if (it->second.contains(column_node->getColumnName()))
+            const auto * declared = declarationsFor(*column_node);
+            if (declared && declared->columns.contains(column_node->getColumnName()))
                 return true;
         }
         return false;
     }
 
     /// Looked up once per table and query: most queries never reach this.
-    std::unordered_map<const IStorage *, NameSet> columns_by_storage;
+    std::unordered_map<const IStorage *, DeclaredComparisons> declarations_by_storage;
+    std::unordered_map<const IQueryTreeNode *, std::vector<const ColumnNode *>> arrays_by_lambda;
 };
 
 }
