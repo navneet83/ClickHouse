@@ -129,7 +129,7 @@ NameSet collectDeclaredComparisons(const ASTPtr & ast, const NameSet & params, D
 DeclaredComparisons declaredComparisons(const StorageInMemoryMetadata & metadata)
 {
     DeclaredComparisons out;
-    for (const auto * key : {&metadata.getPartitionKey(), &metadata.getSortingKey(), &metadata.getPrimaryKey(), &metadata.getSamplingKey()})
+    for (const auto * key : {&metadata.getPartitionKey(), &metadata.getSortingKey(), &metadata.getPrimaryKey()})
         if (key->expression_list_ast)
             collectDeclaredComparisons(key->expression_list_ast, {}, out);
 
