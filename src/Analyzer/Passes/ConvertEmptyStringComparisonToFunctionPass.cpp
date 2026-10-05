@@ -38,10 +38,11 @@ bool isEmptyStringLiteral(const ASTPtr & ast)
     return literal && literal->value.getType() == Field::Types::String && literal->value.safeGet<String>().empty();
 }
 
+/// The full name is kept, so `t.s` inside a tuple is looked up as the query names it and does not stand in for a plain `s`.
 void collectIdentifiers(const ASTPtr & ast, NameSet & names)
 {
     if (const auto * identifier = ast->as<ASTIdentifier>())
-        names.insert(identifier->shortName());
+        names.insert(identifier->name());
     for (const auto & child : ast->children)
         collectIdentifiers(child, names);
 }

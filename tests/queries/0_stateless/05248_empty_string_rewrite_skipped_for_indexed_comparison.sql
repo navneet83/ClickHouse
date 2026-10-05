@@ -61,6 +61,13 @@ INSERT INTO tab VALUES (''), ('x'), ('y'), ('z');
 SELECT count() FROM tab WHERE '' != s SETTINGS force_data_skipping_indices = 'idx';
 DROP TABLE tab;
 
+-- A column inside a tuple is named in full, so `t.s` is kept as written and a plain `s` next to it is still rewritten.
+CREATE TABLE tab (id UInt32, t Tuple(s String), s String, INDEX idx if(t.s = '', 'abc', t.s) TYPE minmax) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2;
+INSERT INTO tab SELECT number, tuple(if(number < 2, '', 'x')), if(number < 2, '', 'y') FROM numbers(4);
+SELECT count() FROM tab WHERE if(t.s = '', 'abc', t.s) = 'abc' SETTINGS force_data_skipping_indices = 'idx';
+SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM tab WHERE if(t.s = '', 'abc', t.s) = 'abc' AND if(s = '', 'abc', s) = 'abc') WHERE explain LIKE '%function_name: empty%';
+DROP TABLE tab;
+
 -- A query over other tables is still rewritten, also when the setting is enabled only on the query.
 SELECT count() FROM (EXPLAIN QUERY TREE SELECT count() FROM plain WHERE if(s = '', 'abc', s) = 'abc') WHERE explain LIKE '%function_name: empty%';
 SET optimize_empty_string_comparisons = 0;
