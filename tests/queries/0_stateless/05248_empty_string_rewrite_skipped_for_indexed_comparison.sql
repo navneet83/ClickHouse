@@ -55,6 +55,11 @@ CREATE TABLE tab (id UInt32, s String, PROJECTION p INDEX if(s = '', 'abc', s) T
 INSERT INTO tab VALUES (1, ''), (2, 'x'), (3, 'y'), (4, ''), (5, 'z');
 SELECT count() FROM tab WHERE if(s = '', 'abc', s) = 'abc' SETTINGS force_optimize_projection_name = 'p';
 DROP TABLE tab;
+-- So is the filter of a projection.
+CREATE TABLE tab (id UInt32, s String, PROJECTION p (SELECT id, s WHERE s = '' ORDER BY id)) ENGINE = MergeTree ORDER BY id SETTINGS index_granularity = 2;
+INSERT INTO tab VALUES (1, ''), (2, 'x'), (3, 'y'), (4, ''), (5, 'z');
+SELECT count() FROM tab WHERE s = '' SETTINGS force_optimize_projection_name = 'p';
+DROP TABLE tab;
 
 -- The comparison may be written as `!=` or with the literal on the left.
 CREATE TABLE tab (s String, INDEX idx ('' != s) TYPE minmax) ENGINE = MergeTree ORDER BY tuple() SETTINGS index_granularity = 2;
