@@ -21,6 +21,8 @@
 #include <Storages/StorageProxy.h>
 #include <Common/FieldVisitors.h>
 
+#include <unordered_set>
+
 namespace DB
 {
 
@@ -172,13 +174,16 @@ StoragePtr getUnderlyingStorage(const QueryTreeNodePtr & source)
     return storage;
 }
 
-void collectColumnNodes(const QueryTreeNodePtr & node, std::vector<const ColumnNode *> & columns)
+/// The analyzer hands an alias out as one shared node, so the tree is a graph and every node is walked once.
+void collectColumnNodes(const QueryTreeNodePtr & node, std::vector<const ColumnNode *> & columns, std::unordered_set<const IQueryTreeNode *> & visited)
 {
+    if (!visited.insert(node.get()).second)
+        return;
     if (const auto * column_node = node->as<ColumnNode>())
         columns.push_back(column_node);
     for (const auto & child : node->getChildren())
         if (child)
-            collectColumnNodes(child, columns);
+            collectColumnNodes(child, columns, visited);
 }
 
 class ConvertEmptyStringComparisonToFunctionVisitor
@@ -271,8 +276,9 @@ private:
         return &it->second;
     }
 
-    /// The arrays of every call that runs a lambda, by the lambda's arguments node. Noted on the way down, since the
-    /// call is entered before its lambda body, and read only when a parameter of that lambda is compared with `''`.
+    /// The array arguments of every call that runs a lambda, by the lambda's arguments node. Noted on the way down,
+    /// since the call is entered before its lambda body, and looked at only when a parameter of that lambda is
+    /// compared with `''`.
     void rememberLambdaArrays(const FunctionNode & function)
     {
         const auto & arguments = function.getArguments().getNodes();
@@ -286,7 +292,31 @@ private:
         auto & arrays = arrays_by_lambda[&lambda->getArguments()];
         for (const auto & argument : arguments)
             if (!argument->as<LambdaNode>())
-                collectColumnNodes(argument, arrays);
+                arrays.push_back(argument);
+    }
+
+    /// Whether the lambda runs over an array whose elements a declaration compares with `''`, worked out once per
+    /// lambda: the arrays may be large shared expressions and may be parameters of an enclosing lambda in turn.
+    bool lambdaRunsOverDeclaredArray(const IQueryTreeNode * lambda_arguments)
+    {
+        if (auto it = lambda_over_declared_array.find(lambda_arguments); it != lambda_over_declared_array.end())
+            return it->second;
+        lambda_over_declared_array[lambda_arguments] = false;
+
+        std::vector<const ColumnNode *> columns;
+        std::unordered_set<const IQueryTreeNode *> visited;
+        for (const auto & array : arrays_by_lambda[lambda_arguments])
+            collectColumnNodes(array, columns, visited);
+
+        bool declared = false;
+        for (const auto * column_node : columns)
+            if (isDeclaredArray(*column_node))
+            {
+                declared = true;
+                break;
+            }
+        lambda_over_declared_array[lambda_arguments] = declared;
+        return declared;
     }
 
     /// Whether the column is an array whose elements a declaration compares with `''`: directly, or through the
@@ -297,13 +327,8 @@ private:
         if (!source)
             return false;
 
-        if (auto it = arrays_by_lambda.find(source.get()); it != arrays_by_lambda.end())
-        {
-            for (const auto * array : it->second)
-                if (isDeclaredArray(*array))
-                    return true;
-            return false;
-        }
+        if (arrays_by_lambda.contains(source.get()))
+            return lambdaRunsOverDeclaredArray(source.get());
 
         const auto * declared = declarationsFor(column_node);
         return declared && declared->arrays.contains(column_node.getColumnName());
@@ -315,14 +340,15 @@ private:
     bool mustStayAsWritten(const QueryTreeNodePtr & expr)
     {
         std::vector<const ColumnNode *> columns;
-        collectColumnNodes(expr, columns);
+        std::unordered_set<const IQueryTreeNode *> visited;
+        collectColumnNodes(expr, columns, visited);
 
         for (const auto * column_node : columns)
         {
             auto source = column_node->getColumnSourceOrNull();
             if (source && arrays_by_lambda.contains(source.get()))
             {
-                if (isDeclaredArray(*column_node))
+                if (lambdaRunsOverDeclaredArray(source.get()))
                     return true;
                 continue;
             }
@@ -336,7 +362,8 @@ private:
 
     /// Looked up once per table and query: most queries never reach this.
     std::unordered_map<const IStorage *, DeclaredComparisons> declarations_by_storage;
-    std::unordered_map<const IQueryTreeNode *, std::vector<const ColumnNode *>> arrays_by_lambda;
+    std::unordered_map<const IQueryTreeNode *, QueryTreeNodes> arrays_by_lambda;
+    std::unordered_map<const IQueryTreeNode *, bool> lambda_over_declared_array;
 };
 
 }
