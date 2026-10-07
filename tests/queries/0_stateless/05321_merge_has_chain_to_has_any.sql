@@ -91,7 +91,6 @@ INSERT INTO tab_ids VALUES (1, [5, 6]), (2, [7]), (3, [8]);
 SELECT id FROM tab_ids WHERE NOT has(ids, 5) AND NOT has(ids, 7) ORDER BY id;
 SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_ids WHERE NOT has(ids, 5) AND NOT has(ids, 7));
 SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_ids WHERE NOT has(ids, -1) AND NOT has(ids, 7));
-DROP TABLE tab_ids;
 
 -- Constants of a different kind than the element type are not merged: `String` for `Enum` or `FixedString`, and a
 -- `Float64` that does not survive the round trip through `Float32`.
@@ -103,8 +102,8 @@ SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE
 SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_types WHERE NOT has(x, 0.1) AND NOT has(x, 0.2));
 DROP TABLE tab_types;
 
--- Calls on different arrays, on a non-deterministic array, a `hasAll` with two elements, a NULL element, a single call, a disabled setting
--- and a chain already written with `hasAny` are left alone.
+-- Calls on different arrays, on a non-deterministic array, a `hasAll` with two elements, a NULL element, a single call and a
+-- disabled setting are left alone. A member already written as `hasAny` joins the chain.
 SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE NOT has(words, 'just') AND NOT has(other, 'just'));
 SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE has([rand() % 2], toUInt32(1)) OR has([rand() % 2], toUInt32(0)));
 SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE NOT hasAll(words, ['just', 'think']) AND NOT has(words, 'from'));
@@ -121,4 +120,48 @@ SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%
     FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE NOT has(words, 'just') AND NOT has(words, 'from') AND NOT has(other, 'a') AND NOT has(other, 'b') AND NOT has(other, 'c') AND NOT has(other, 'd'));
 SELECT id FROM tab WHERE NOT has(words, 'just') AND NOT has(words, 'from') AND NOT has(other, 'a') AND NOT has(other, 'b') AND NOT has(other, 'c') AND NOT has(other, 'd') ORDER BY id;
 
+-- Needles are sets, so `hasAny` members merge by union.
+SET optimize_min_has_chain_length = 2;
+SELECT 'union of hasAny members';
+SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%function_name: hasAll,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE hasAny(words, ['just']) OR has(words, 'from') OR hasAny(words, ['people', 'your']));
+SELECT id FROM tab WHERE hasAny(words, ['just']) OR has(words, 'from') OR hasAny(words, ['people', 'your']) ORDER BY id;
+SELECT id FROM tab WHERE hasAny(words, ['just']) OR has(words, 'from') OR hasAny(words, ['people', 'your']) ORDER BY id SETTINGS optimize_rewrite_has_chain_to_has_any = 0;
+SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%function_name: not,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE NOT hasAny(words, ['just', 'from']) AND NOT hasAny(words, ['people']) AND notHas(words, 'your'));
+SELECT id FROM tab WHERE NOT hasAny(words, ['just', 'from']) AND NOT hasAny(words, ['people']) AND notHas(words, 'your') ORDER BY id;
+SELECT id FROM tab WHERE NOT hasAny(words, ['just', 'from']) AND NOT hasAny(words, ['people']) AND notHas(words, 'your') ORDER BY id SETTINGS optimize_rewrite_has_chain_to_has_any = 0;
+
+SELECT 'no merged form: a chain of plain has or hasAll under AND, NOT hasAll under AND, hasAny under AND; an empty or mistyped member is kept and the rest still merge';
+SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%function_name: hasAll,%'), countIf(explain LIKE '%function_name: has,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE has(words, 'just') AND hasAll(words, ['from']) AND has(words, 'people'));
+SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%function_name: hasAll,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE NOT hasAll(words, ['just', 'from']) AND NOT hasAll(words, ['people', 'your']));
+SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE hasAny(words, ['just', 'from']) AND hasAny(words, ['people', 'your']));
+SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE hasAny(words, []) OR has(words, 'just') OR hasAny(words, ['from']));
+SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_ids WHERE hasAny(ids, [1, -1]) OR has(ids, 2) OR has(ids, 3));
+-- A `hasAny` whose constant has no common type with the array throws on its own, so it is kept and keeps throwing.
+SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_ids WHERE hasAny(ids, [5.0, 7.0]) OR has(ids, 6) OR has(ids, 8));
+SELECT id FROM tab_ids WHERE hasAny(ids, [5.0, 7.0]) OR has(ids, 6) OR has(ids, 8); -- { serverError NO_COMMON_TYPE }
+-- A `hasAny` constant of another width that does convert merges, a NULL needle inside one keeps the member whole, and a duplicate needle is harmless.
+SELECT id FROM tab_ids WHERE hasAny(ids, [5, 7]) OR has(ids, 6) ORDER BY id;
+SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_ids WHERE hasAny(ids, [5, 7]) OR has(ids, 6));
+SELECT countIf(explain LIKE '%function_name: hasAny,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab WHERE hasAny(words, ['from', NULL]) OR has(words, 'just') OR has(words, 'people'));
+SELECT id FROM tab WHERE has(words, 'just') OR hasAny(words, ['just', 'from']) ORDER BY id;
+
+-- Float needles merge when they convert exactly. A NaN needle does not: `has` finds it in a `LowCardinality` dictionary
+-- by its bytes and `hasAny` compares values, so the member is kept and the rows stay the same with the rewrite on and off.
+SET allow_suspicious_low_cardinality_types = 1;
+DROP TABLE IF EXISTS tab_floats;
+CREATE TABLE tab_floats (id UInt32, f Array(Float64), lc Array(LowCardinality(Float64))) ENGINE = MergeTree ORDER BY id;
+INSERT INTO tab_floats VALUES (1, [nan], [nan]), (2, [1.0], [1.0]), (3, [0.5, 7.0], [0.5, 7.0]), (4, [], []);
+SELECT 'floats';
+SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%function_name: has,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_floats WHERE has(f, 0.5) OR has(f, 1) OR has(f, 2) OR has(f, 3));
+SELECT groupArray(id) FROM (SELECT id FROM tab_floats WHERE has(f, 0.5) OR has(f, 1) OR has(f, 2) OR has(f, 3) ORDER BY id);
+SELECT groupArray(id) FROM (SELECT id FROM tab_floats WHERE has(f, 0.5) OR has(f, 1) OR has(f, 2) OR has(f, 3) ORDER BY id) SETTINGS optimize_rewrite_has_chain_to_has_any = 0;
+SELECT countIf(explain LIKE '%function_name: hasAny,%'), countIf(explain LIKE '%function_name: has,%') FROM (EXPLAIN QUERY TREE SELECT id FROM tab_floats WHERE has(lc, nan) OR has(lc, 1.0) OR has(lc, 2.0) OR has(lc, 3.0));
+SELECT groupArray(id) FROM (SELECT id FROM tab_floats WHERE has(lc, nan) OR has(lc, 1.0) OR has(lc, 2.0) OR has(lc, 3.0) ORDER BY id);
+SELECT groupArray(id) FROM (SELECT id FROM tab_floats WHERE has(lc, nan) OR has(lc, 1.0) OR has(lc, 2.0) OR has(lc, 3.0) ORDER BY id) SETTINGS optimize_rewrite_has_chain_to_has_any = 0;
+SELECT groupArray(id) FROM (SELECT id FROM tab_floats WHERE NOT has(lc, nan) AND NOT has(lc, 1.0) AND NOT has(lc, 2.0) AND NOT has(lc, 3.0) ORDER BY id);
+SELECT groupArray(id) FROM (SELECT id FROM tab_floats WHERE NOT has(lc, nan) AND NOT has(lc, 1.0) AND NOT has(lc, 2.0) AND NOT has(lc, 3.0) ORDER BY id) SETTINGS optimize_rewrite_has_chain_to_has_any = 0;
+DROP TABLE tab_floats;
+SET optimize_min_has_chain_length = DEFAULT;
+
 DROP TABLE tab;
+DROP TABLE tab_ids;

@@ -11,8 +11,10 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/getLeastSupertype.h>
 #include <Interpreters/convertFieldToType.h>
 
+#include <cmath>
 #include <unordered_set>
 
 namespace DB
@@ -41,18 +43,23 @@ bool isExpressionNonDeterministic(const QueryTreeNodePtr & node)
     return false;
 }
 
-struct SingleElementHas
+struct Member
 {
     QueryTreeNodePtr array;
-    Field element;
+    Array elements;
     DataTypePtr element_type;
 };
 
-/// `has(arr, c)` or `hasAll(arr, [c])` with a constant `c` of the element type of `arr`.
-std::optional<SingleElementHas> matchSingleElementHas(const QueryTreeNodePtr & node)
+/// `has(arr, c)`, `hasAny(arr, [c, ...])` or `hasAll(arr, [c])` with constant elements of the element type of `arr`.
+/// A `hasAll` with two or more elements is a conjunction, which no `hasAny` can take in.
+std::optional<Member> matchMember(const QueryTreeNodePtr & node)
 {
     const auto * function = node->as<FunctionNode>();
-    if (!function || (function->getFunctionName() != "has" && function->getFunctionName() != "hasAll"))
+    if (!function)
+        return {};
+
+    const auto & name = function->getFunctionName();
+    if (name != "has" && name != "hasAny" && name != "hasAll")
         return {};
 
     const auto & arguments = function->getArguments().getNodes();
@@ -64,23 +71,24 @@ std::optional<SingleElementHas> matchSingleElementHas(const QueryTreeNodePtr & n
     if (!constant || !array_type)
         return {};
 
-    Field element;
+    Array elements;
     DataTypePtr constant_element_type;
-    if (function->getFunctionName() == "has")
+    if (name == "has")
     {
-        element = constant->getValue();
+        elements.push_back(constant->getValue());
         constant_element_type = constant->getResultType();
     }
     else
     {
         const auto * constant_array_type = typeid_cast<const DataTypeArray *>(constant->getResultType().get());
-        if (!constant_array_type || constant->getValue().safeGet<Array>().size() != 1)
+        if (!constant_array_type)
             return {};
-        element = constant->getValue().safeGet<Array>()[0];
+        elements = constant->getValue().safeGet<Array>();
         constant_element_type = constant_array_type->getNestedType();
     }
 
-    if (element.isNull() || isExpressionNonDeterministic(arguments[0]))
+    /// `hasAny(arr, [])` is false and `hasAll(arr, [])` is true whatever the array holds; neither has anything to merge.
+    if (elements.empty() || isExpressionNonDeterministic(arguments[0]))
         return {};
 
     /// `has` compares the constant with the elements as values of the array's type, so the merged array keeps that
@@ -89,27 +97,44 @@ std::optional<SingleElementHas> matchSingleElementHas(const QueryTreeNodePtr & n
     /// because `has` and `hasAny` compare a `String` constant against an `Enum` or `FixedString` element differently.
     auto element_type = removeLowCardinalityAndNullable(array_type->getNestedType());
     auto constant_type = removeLowCardinalityAndNullable(constant_element_type);
-    if (!constant_type->equals(*element_type))
+    const bool convert = !constant_type->equals(*element_type);
+    if (convert && (!isNumber(constant_type) || !isNumber(element_type)))
+        return {};
+
+    /// `hasAny` and `hasAll` need a common type of the two arrays and throw without one, for example for `[5.0]` against
+    /// `Array(UInt64)`. Such a call must keep throwing on its own, so it is not merged into a chain that would run.
+    if (convert && name != "has" && !tryGetLeastSupertype(DataTypes{array_type->getNestedType(), constant_element_type}))
+        return {};
+
+    for (auto & element : elements)
     {
-        if (!isNumber(constant_type) || !isNumber(element_type))
+        /// `has` finds a NaN needle in an `Array(LowCardinality(Float64))` by its bytes in the dictionary, while `hasAny`
+        /// compares values and never matches NaN, so a NaN member stays as written.
+        if (element.isNull() || (element.getType() == Field::Types::Float64 && std::isnan(element.safeGet<Float64>())))
             return {};
-        element = tryConvertFieldToTypeExact(element, *element_type, constant_type.get());
-        if (element.isNull())
-            return {};
+        if (convert)
+        {
+            element = tryConvertFieldToTypeExact(element, *element_type, constant_type.get());
+            if (element.isNull())
+                return {};
+        }
     }
 
-    return SingleElementHas{arguments[0], std::move(element), std::move(element_type)};
+    if (name == "hasAll" && elements.size() > 1)
+        return {};
+
+    return Member{arguments[0], std::move(elements), std::move(element_type)};
 }
 
-/// `NOT has(arr, c)`, `NOT hasAll(arr, [c])` or `notHas(arr, c)`.
-std::optional<SingleElementHas> matchNegatedSingleElementHas(const QueryTreeNodePtr & node)
+/// `NOT has(arr, c)`, `NOT hasAny(arr, [c, ...])`, `NOT hasAll(arr, [c])` or `notHas(arr, c)`.
+std::optional<Member> matchNegatedMember(const QueryTreeNodePtr & node)
 {
     const auto * function = node->as<FunctionNode>();
     if (!function)
         return {};
 
     if (function->getFunctionName() == "not" && function->getArguments().getNodes().size() == 1)
-        return matchSingleElementHas(function->getArguments().getNodes()[0]);
+        return matchMember(function->getArguments().getNodes()[0]);
 
     if (function->getFunctionName() != "notHas")
         return {};
@@ -117,7 +142,7 @@ std::optional<SingleElementHas> matchNegatedSingleElementHas(const QueryTreeNode
     /// Look at `notHas(arr, c)` as `has(arr, c)` so the matcher above can be reused. This node is thrown away.
     auto has_node = std::make_shared<FunctionNode>("has");
     has_node->getArguments().getNodes() = function->getArguments().getNodes();
-    return matchSingleElementHas(has_node);
+    return matchMember(has_node);
 }
 
 QueryTreeNodePtr makeHasAny(const QueryTreeNodePtr & array, Array elements, const DataTypePtr & element_type, bool negate, const ContextPtr & context)
@@ -146,7 +171,8 @@ struct Group
     DataTypePtr element_type;
 };
 
-/// `NOT a AND NOT b` is `NOT (a OR b)`, so negated calls merge under `and` and plain ones under `or`.
+/// Needles are sets, so a chain merges into the union of its needles: `has(a) OR hasAny([b, c])` is `hasAny([a, b, c])`,
+/// and `NOT a AND NOT b` is `NOT (a OR b)`, so negated members merge under `and` and plain ones under `or`.
 QueryTreeNodePtrWithHashMap<Group> collectGroups(const FunctionNode & function)
 {
     const bool negated = function.getFunctionName() == "and";
@@ -155,13 +181,13 @@ QueryTreeNodePtrWithHashMap<Group> collectGroups(const FunctionNode & function)
     QueryTreeNodePtrWithHashMap<Group> groups;
     for (size_t i = 0; i < operands.size(); ++i)
     {
-        auto match = negated ? matchNegatedSingleElementHas(operands[i]) : matchSingleElementHas(operands[i]);
+        auto match = negated ? matchNegatedMember(operands[i]) : matchMember(operands[i]);
         if (!match)
             continue;
 
         auto & group = groups[match->array];
         group.positions.push_back(i);
-        group.elements.push_back(std::move(match->element));
+        group.elements.insert(group.elements.end(), match->elements.begin(), match->elements.end());
         group.element_type = std::move(match->element_type);
     }
     return groups;
@@ -294,7 +320,7 @@ private:
             return;
 
         /// Without a text index, `hasAny` with fewer than four elements is slower than the separate `has` calls,
-        /// so short chains are left alone unless the setting asks for them.
+        /// so short chains are left alone unless the setting asks for them. The length counts members, not needles.
         const size_t min_chain_length = std::max<size_t>(2, getSettings()[Setting::optimize_min_has_chain_length]);
 
         std::unordered_set<const IQueryTreeNode *> visited;

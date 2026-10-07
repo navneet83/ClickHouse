@@ -6911,11 +6911,11 @@ Rewrite `has` functions to `IN` when the first argument is a constant array. For
 )", 0, \
         {"26.6", false, true, "New setting"}) \
     DECLARE(Bool, optimize_rewrite_has_chain_to_has_any, true, R"(
-Merge `has`, `hasAll` and `notHas` calls with one constant element on the same array in `WHERE`, `PREWHERE` or `JOIN ON` into a single `hasAny`. `NOT has(arr, 'a') AND NOT hasAll(arr, ['b'])` becomes `NOT hasAny(arr, ['a', 'b'])`, and `has(arr, 'a') OR hasAll(arr, ['b'])` becomes `hasAny(arr, ['a', 'b'])`. A text index answers one `hasAny` once per block instead of once per call.
+Merge a chain of `has`, `hasAny`, single-element `hasAll` and `notHas` calls with constant needles on the same array in `WHERE`, `PREWHERE` or `JOIN ON` into one `hasAny` over the union of the needles. Once at least `optimize_min_has_chain_length` calls test the same array, `has(arr, 'a') OR hasAny(arr, ['b', 'c']) OR has(arr, 'd') OR has(arr, 'e')` becomes `hasAny(arr, ['a', 'b', 'c', 'd', 'e'])`, and `NOT has(arr, 'a') AND NOT hasAll(arr, ['b']) AND NOT has(arr, 'c') AND NOT has(arr, 'd')` becomes `NOT hasAny(arr, ['a', 'b', 'c', 'd'])`. A text index answers one `hasAny` once per block instead of once per call.
 )", 0, \
         {"26.10", false, true, "New setting"}) \
     DECLARE(UInt64, optimize_min_has_chain_length, 4, R"(
-The minimum number of `has` or `hasAll` calls on one array that `optimize_rewrite_has_chain_to_has_any` merges into a `hasAny`. Without a text index, `hasAny` looks the elements up in a hash set only from four elements on, and with fewer it is slower than the separate `has` calls, so shorter chains are left as written. Values below 2 are treated as 2.
+The minimum number of calls on one array that `optimize_rewrite_has_chain_to_has_any` merges into one `hasAny`; it counts calls, not needles. Without a text index, `hasAny` looks `String` needles up in a hash set only from four needles on, and with fewer it is slower than the separate `has` calls, so shorter chains are left as written. Values below 2 are treated as 2.
 )", 0, \
         {"26.10", 4, 4, "New setting"}) \
     DECLARE(Bool, optimize_dictget_tuple_element, true, R"(

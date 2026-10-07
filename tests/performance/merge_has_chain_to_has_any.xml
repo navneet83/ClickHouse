@@ -16,5 +16,7 @@
     <query>SELECT count(), sum(id) FROM perf_has_chain WHERE NOT has(nums, 1) AND NOT has(nums, 2) AND NOT has(nums, 3) AND NOT has(nums, 4)</query>
     <query>SELECT count(), sum(id) FROM perf_has_chain WHERE NOT has(nums, 1) AND NOT has(nums, 2) AND NOT has(nums, 3) AND NOT has(nums, 4) AND NOT has(nums, 5) AND NOT has(nums, 6) AND NOT has(nums, 7) AND NOT has(nums, 8) AND NOT has(nums, 9) AND NOT has(nums, 10) AND NOT has(nums, 11) AND NOT has(nums, 12) AND NOT has(nums, 13) AND NOT has(nums, 14) AND NOT has(nums, 15) AND NOT has(nums, 16)</query>
 
+    <query>SELECT count(), sum(id) FROM perf_has_chain WHERE NOT hasAny(tags, ['tag20011', 'tag23918']) AND NOT hasAny(tags, ['tag27825', 'tag31732']) AND NOT has(tags, 'tag35639') AND NOT has(tags, 'tag39546')</query>
+
     <drop_query>DROP TABLE IF EXISTS perf_has_chain</drop_query>
 </test>

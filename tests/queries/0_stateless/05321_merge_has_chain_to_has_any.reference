@@ -63,8 +63,44 @@ f	and(not(has(words, \'just\')), not(has(words, \'from\')))
 0
 0
 0
-1	1
+1	0
 0
 1
 1	2
 3
+union of hasAny members
+1	0
+1
+2
+3
+5
+1
+2
+3
+5
+1	1
+4
+4
+no merged form: a chain of plain has or hasAll under AND, NOT hasAll under AND, hasAny under AND; an empty or mistyped member is kept and the rest still merge
+0	1	2
+0	2
+2
+2
+2
+2
+1
+2
+1
+2
+1
+2
+5
+floats
+1	0
+[2,3]
+[2,3]
+1	1
+[1,2]
+[1,2]
+[3,4]
+[3,4]
