@@ -6917,7 +6917,7 @@ Merge `has`, `hasAll` and `notHas` calls with one constant element on the same a
     DECLARE(UInt64, optimize_min_has_chain_length, 4, R"(
 The minimum number of `has` or `hasAll` calls on one array that `optimize_rewrite_has_chain_to_has_any` merges into a `hasAny`. Without a text index, `hasAny` looks the elements up in a hash set only from four elements on, and with fewer it is slower than the separate `has` calls, so shorter chains are left as written. Values below 2 are treated as 2.
 )", 0, \
-        {"26.10", 0, 4, "New setting"}) \
+        {"26.10", 4, 4, "New setting"}) \
     DECLARE(Bool, optimize_dictget_tuple_element, true, R"(
 Rewrite `tupleElement(dictGet('dict', ('a', 'b', 'c'), key), 2)` into `dictGet('dict', 'b', key)` to avoid fetching unnecessary dictionary attributes. Supports positional (`.1`, `.2`, ...) and named (`.b`) access, and also applies to `dictGetOrDefault` when the default argument is a constant tuple or a `tuple(...)` of constants.
 )", 0, \
