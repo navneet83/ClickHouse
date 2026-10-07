@@ -17,6 +17,9 @@ using TextIndexHeaderCachePtr = std::shared_ptr<TextIndexHeaderCache>;
 class TextIndexPostingsCache;
 using TextIndexPostingsCachePtr = std::shared_ptr<TextIndexPostingsCache>;
 
+class TextIndexSubstringIndexCache;
+using TextIndexSubstringIndexCachePtr = std::shared_ptr<TextIndexSubstringIndexCache>;
+
 class TokensCardinalitiesCache;
 using TokensCardinalitiesCachePtr = std::shared_ptr<TokensCardinalitiesCache>;
 
@@ -125,6 +128,7 @@ public:
     TextIndexTokensCachePtr tokensCache() const { return tokens_cache; }
     TextIndexHeaderCachePtr headerCache() const { return header_cache; }
     TextIndexPostingsCachePtr postingsCache() const { return postings_cache; }
+    TextIndexSubstringIndexCachePtr substringIndexCache() const { return substring_index_cache; }
     TokensCardinalitiesCachePtr cardinalitiesCache() const { return cardinalities_cache; }
     bool useGlobalHeaderCache() const { return use_global_header_cache; }
 
@@ -257,6 +261,7 @@ private:
     TextIndexTokensCachePtr tokens_cache;
     /// Cache for headers of the text index
     TextIndexHeaderCachePtr header_cache;
+    TextIndexSubstringIndexCachePtr substring_index_cache;
     /// Whether the global header cache is used or a local per-query one.
     bool use_global_header_cache = false;
     /// Cache for posting lists of tokens (and phrase-search results, keyed with the Phrase discriminator).

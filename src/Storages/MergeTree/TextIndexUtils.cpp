@@ -11,6 +11,7 @@
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeIOSettings.h>
 #include <Storages/MergeTree/MergeTreeIndexText.h>
+#include <Storages/MergeTree/TextIndexSubstringIndex.h>
 #include <Storages/MergeTree/MergeTreeIndices.h>
 #include <Storages/MergeTree/MergeTreeIndicesSerialization.h>
 #include <Storages/MergeTree/TextIndexPositionCodec.h>
@@ -256,6 +257,8 @@ void BuildTextIndexTransform::writeTemporarySegment(size_t i)
 {
     auto index_file_name = fmt::format("{}_{}_{}", index_file_prefix, segment_numbers[i]++, indexes[i]->getFileName());
     auto index_substreams = indexes[i]->getSubstreams();
+    /// A segment is read back by the merge through the dictionary and postings only; its substring index would be built and never used.
+    std::erase_if(index_substreams, [](const auto & substream) { return substream.type == MergeTreeIndexSubstream::Type::TextIndexSubstringIndex; });
 
     auto & aggregator_text = typeid_cast<MergeTreeIndexAggregatorText &>(*aggregators[i]);
     auto granule = aggregator_text.getGranuleAndReset();
@@ -438,6 +441,7 @@ MergeTextIndexesTask::MergeTextIndexesTask(
         writer_settings);
 
     auto substreams = index_ptr->getSubstreams();
+    std::erase_if(substreams, [](const auto & substream) { return substream.type == MergeTreeIndexSubstream::Type::TextIndexSubstringIndex; });
 
     for (size_t i = 0; i < segments.size(); ++i)
     {
@@ -1035,6 +1039,19 @@ void MergeTextIndexesTask::flushDictionaryBlock()
 
     TextIndexSerialization::serializeTokens(output_str, ostr, tokens_format);
 
+    if (params.substring_index && !substring_index_tokens_dropped)
+    {
+        if (!substring_index_tokens)
+            substring_index_tokens = ColumnString::create();
+        substring_index_tokens->insertRangeFrom(output_str, 0, num_tokens);
+        /// The chars hold every token plus one byte each, which is the text the index is built over.
+        if (assert_cast<const ColumnString &>(*substring_index_tokens).getChars().size() > params.substring_index_max_dictionary_size)
+        {
+            substring_index_tokens = nullptr;
+            substring_index_tokens_dropped = true;
+        }
+    }
+
     for (size_t i = 0; i < num_tokens; ++i)
     {
         TextIndexSerialization::serializeTokenInfo(ostr, output_infos[i]);
@@ -1136,12 +1153,32 @@ void MergeTextIndexesTask::finalize()
 
     auto * index_stream = output_streams.at(MergeTreeIndexSubstream::Type::Regular);
 
+    bool has_substring_index = false;
+    if (params.substring_index && !substring_index_tokens_dropped)
+    {
+        auto * substring_index_stream = output_streams.at(MergeTreeIndexSubstream::Type::TextIndexSubstringIndex);
+        if (!substring_index_stream)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Index with type 'text' and a substring index must have a substring index stream");
+
+        if (!substring_index_tokens)
+            substring_index_tokens = ColumnString::create();
+        const auto & tokens = assert_cast<const ColumnString &>(*substring_index_tokens);
+        auto substring_index = TextIndexSubstringIndex::build(
+            tokens.size(), [&](size_t i) { return std::string_view(tokens.getDataAt(i)); }, params.dictionary_block_size, params.substring_index_max_dictionary_size);
+        if (substring_index)
+        {
+            substring_index->serialize(substring_index_stream->compressed_hashing);
+            has_substring_index = true;
+        }
+    }
+
     TextIndexHeader header
     {
         .version = params.serialization_version,
         .codec_type = postings_serialization.getPostingListCodec()->getType(),
         .has_positions = params.positions != 0,
         .positions_codec = params.positions_codec,
+        .has_substring_index = has_substring_index,
         .sparse_index = DictionarySparseIndex(std::move(sparse_index_tokens), std::move(sparse_index_offsets)),
     };
 

@@ -147,6 +147,8 @@
     M(TextIndexTokensCacheNegativeMisses, "Number of absent text index tokens added to the cache after a dictionary lookup.", ValueType::Number) \
     M(TextIndexHeaderCacheHits, "Number of times a header has been found in the cache.", ValueType::Number) \
     M(TextIndexHeaderCacheMisses, "Number of times a header has not been found in the cache.", ValueType::Number) \
+    M(TextIndexSubstringIndexCacheHits, "Number of times the substring index of a text index has been found in the cache.", ValueType::Number) \
+    M(TextIndexSubstringIndexCacheMisses, "Number of times the substring index of a text index has been loaded into the cache.", ValueType::Number) \
     M(TextIndexPostingsCacheHits, "Number of times a text index posting list has been found in the cache.", ValueType::Number) \
     M(TextIndexPostingsCacheMisses, "Number of times a text index posting list has not been found in the cache.", ValueType::Number) \
     M(TextIndexReadSparseIndexBlocks, "Number of times a sparse index block has been read from the text index.", ValueType::Number) \
@@ -176,6 +178,8 @@
     M(TextIndexLazySegmentsSkippedResolved, "Number of segments skipped because the output region was already resolved (all-ones for OR, all-zeros for AND) in lazy posting list mode.", ValueType::Number) \
     M(TextIndexLazyBlocksSkippedResolved, "Number of packed blocks skipped because the output region was already resolved (all-ones for OR, all-zeros for AND) in lazy posting list mode.", ValueType::Number) \
     M(TextIndexDiscardPatternScan, "Number of times pattern-based dictionary scan in a text index was discarded because the number of posting lists to read exceeded the threshold.", ValueType::Number) \
+    M(TextIndexSubstringIndexSearches, "Number of substring searches answered from the substring index of a text index instead of a dictionary scan.", ValueType::Number) \
+    M(TextIndexSubstringIndexSelectedBlocks, "Number of dictionary blocks the substring index of a text index selected for reading.", ValueType::Number) \
     M(TextIndexGenericExclusionSearchAlgorithm, "Number of times the generic exclusion search algorithm is used over the text index.", ValueType::Number) \
     M(TextIndexGenericExclusionSearchStepLimitReached, "Number of times the generic exclusion search over the text index reached merge_tree_generic_exclusion_search_max_steps and accepted the remaining mark ranges without further splitting.", ValueType::Number) \
     M(QueryConditionCacheHits, "Number of times an entry has been found in the query condition cache (and reading of marks can be skipped). Only updated for SELECT queries with SETTING use_query_condition_cache = 1.", ValueType::Number) \

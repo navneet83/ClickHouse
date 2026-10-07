@@ -157,6 +157,7 @@ public:
     RegexpMatchKind getMatchKind() const { return match_kind; }
 
     std::string_view getRequiredSubstring() const { return required_substring; }
+    bool isCaseInsensitive() const { return is_case_insensitive; }
 
     /// Finds `required_substring` in `[haystack, haystack + haystack_size)` with the searcher `match` uses, so
     /// `match` rejects any subject this does not find it in. Returns the end when it does not occur.

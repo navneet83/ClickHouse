@@ -391,6 +391,8 @@
     M(TextIndexTokensCacheCells, "Number of entries in the text index tokens cache") \
     M(TextIndexHeaderCacheBytes, "Size of the text index header cache in bytes") \
     M(TextIndexHeaderCacheCells, "Number of entries in text index header cache") \
+    M(TextIndexSubstringIndexCacheBytes, "Size of the text index substring index cache in bytes") \
+    M(TextIndexSubstringIndexCacheCells, "Number of entries in the text index substring index cache") \
     M(TextIndexPostingsCacheBytes, "Size of the text index posting lists cache in bytes") \
     M(TextIndexPostingsCacheCells, "Number of entries in the text index posting lists cache") \
     M(PointInPolygonCacheBytes, "Size in bytes of the cache of preprocessed constant polygons for the `pointInPolygon` function") \

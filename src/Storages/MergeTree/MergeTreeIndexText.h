@@ -30,6 +30,8 @@
 namespace DB
 {
 
+class TextIndexSubstringIndex;
+
 /**
   * Implementation of inverted index for text search.
   *
@@ -94,6 +96,10 @@ struct MergeTreeIndexTextParams
     ASTPtr preprocessor;
     ASTPtr postprocessor;
     MergeTreeTextIndexSerializationVersion serialization_version = MergeTreeTextIndexSerializationVersion::V0_Initial;
+    /// Build a substring index over the dictionary, so that `LIKE '%needle%'` reads the blocks that can hold the needle instead of all.
+    size_t substring_index = 0;
+    /// A dictionary larger than this gets no substring index; see the `text_index_substring_index_max_dictionary_size` setting.
+    size_t substring_index_max_dictionary_size = 0;
 };
 
 using PostingList = roaring::Roaring;
@@ -330,6 +336,8 @@ struct TextIndexHeader
     /// has_positions and positions_codec are persisted for version >= V2_WithPositions.
     bool has_positions = false;
     UInt8 positions_codec = 0;
+    /// Persisted for version >= V3_WithSubstringIndex.
+    bool has_substring_index = false;
     DictionarySparseIndex sparse_index;
 };
 
@@ -418,13 +426,15 @@ private:
     /// Reads dictionary blocks and analyzes them for tokens.
     void analyzeDictionaryForTokens(const DictionarySparseIndex & sparse_index, MergeTreeIndexReaderStream & dictionary_stream, MergeTreeIndexDeserializationState & state);
     /// Reads dictionary blocks and analyzes them for patterns.
-    void analyzeDictionaryForPatterns(const DictionarySparseIndex & sparse_index, MergeTreeIndexReaderStream & dictionary_stream, MergeTreeIndexDeserializationState & state);
+    void analyzeDictionaryForPatterns(const DictionarySparseIndex & sparse_index, MergeTreeIndexReaderStream & dictionary_stream, MergeTreeIndexDeserializationState & state, const TextIndexSubstringIndex * substring_index);
     /// Fills tokens and their infos from the cache.
     /// Returns tokens that are not in the cache and need to be read from the dictionary file.
     std::vector<String> fillTokensFromCache(MergeTreeIndexDeserializationState & state);
     std::pair<std::vector<size_t>, NameSet> matchTokens(const ColumnString & all_tokens, std::vector<std::string_view> needed_tokens);
 
     std::shared_ptr<TextIndexHeader> loadHeader(MergeTreeIndexReaderStream & header_stream, MergeTreeIndexDeserializationState & state);
+    static std::shared_ptr<TextIndexSubstringIndex> loadSubstringIndex(MergeTreeIndexReaderStream & stream, MergeTreeIndexDeserializationState & state, const String & index_id);
+    bool selectBlocksWithSubstringIndex(const TextIndexSubstringIndex * substring_index, size_t max_occurrences, size_t num_blocks, std::vector<size_t> & blocks) const;
     void analyzePostings(PostingsSerialization & postings_serialization, MergeTreeIndexReaderStream & stream, MergeTreeIndexDeserializationState & state);
 
     bool is_empty = true;

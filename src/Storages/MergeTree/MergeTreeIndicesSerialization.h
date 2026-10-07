@@ -41,6 +41,7 @@ struct MergeTreeIndexSubstream
         TextIndexDictionary,
         TextIndexPostings,
         TextIndexPositions,
+        TextIndexSubstringIndex,
     };
 
     Type type;

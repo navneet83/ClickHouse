@@ -10189,6 +10189,10 @@ Maximum number of large postings to read when text index LIKE evaluation by the 
 Requires `use_text_index_like_evaluation_by_dictionary_scan` to be enabled.
 )", 0, \
         {"26.4", 50, 50, "New setting"}) \
+    DECLARE(UInt64, text_index_substring_index_max_occurrences, 16384, R"(
+When a text index has a substring index (`substring_index = 1`), a `LIKE` pattern whose literal has more than this many occurrences in the part's token dictionary is answered by the dictionary scan instead. Locating an occurrence costs as many steps as the match is deep in its token, so this bound is on the work spent before the scan would have given up anyway after `text_index_like_max_postings_to_read` large posting lists.
+)", 0, \
+        {"26.10", 16384, 16384, "New setting"}) \
     DECLARE(Bool, use_text_index_tokens_cache, true, R"(
 Whether to cache deserialized text index token infos in memory.
 Using the text index tokens cache can significantly reduce latency and increase throughput when working with a large number of text index queries.

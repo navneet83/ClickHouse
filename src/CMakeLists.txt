@@ -769,6 +769,7 @@ target_link_libraries(dbms PUBLIC
     ch_contrib::driftsort)
 
 target_link_libraries(dbms PRIVATE ch_contrib::zstd)
+target_link_libraries(dbms PRIVATE ch_contrib::libsais)
 
 if (TARGET ch_contrib::simdcomp)
     target_link_libraries (dbms PRIVATE ch_contrib::simdcomp)

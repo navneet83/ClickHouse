@@ -1,0 +1,79 @@
+infix	55
+infix, no index	55
+infix 2	55
+infix 2, no index	55
+hex infix	0
+hex infix, no index	0
+absent	0
+two patterns	0
+two patterns, no index	0
+suffix	0
+suffix, no index	0
+prefix	0
+prefix, no index	0
+not like	1945
+not like, no index	1945
+direct	55
+common	1945
+common, no index	1945
+regex	55
+regex, no index	55
+ilike	55
+ilike, no index	55
+token	55
+two parts	104
+two parts, no index	104
+merged	104
+merged, no index	104
+merged hex	0
+merged hex, no index	0
+parts	1
+05328 infix	1	1
+05328 absent	1	0
+05328 two	2	1
+05328 suffix	1	1
+05328 not like	0	0
+05328 direct	1	1
+05328 regex	0	0
+05328 token	0	1
+05328 two parts	2	2
+05328 merged	1	1
+05328 common	0	1
+05328 ilike	0	1
+05328 prefix	0	0
+cache	1	1
+edge 512	1
+edge 512, no index	1
+edge 512 absent	0
+nul a	1
+nul b	1
+nul b structural	1
+nul c	1
+nul c structural	0
+nul c empty	1
+boundary 510	1
+boundary 511	1
+boundary 512	1
+boundary 1023	1
+boundary 1024	1
+boundary lengths	2	1	1	1025
+boundary, no index	1	1	1	1	1
+threshold 1	2
+threshold 2	2
+materialized	1
+cap	1
+v2	1
+05328 cap	0
+05328 materialized	1
+05328 threshold 1	0
+05328 threshold 2	1
+05328 v2	1
+05328 boundary 1023	1	1
+05328 boundary 1024	1	1
+05328 boundary 510	1	1
+05328 boundary 511	1	1
+05328 boundary 512	1	1
+05328 nul a	0	1
+05328 nul b	0	1
+05328 nul c	1	1
+05328 nul c structural	1	0

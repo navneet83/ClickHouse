@@ -705,6 +705,15 @@ This setting can be modified at runtime and will take effect immediately.
 )", 0) \
     DECLARE(UInt64, text_index_header_cache_max_entries, DEFAULT_TEXT_INDEX_HEADER_CACHE_MAX_ENTRIES, "Size of cache for text index header in entries. Zero means disabled.", 0) \
     DECLARE(Double, text_index_header_cache_size_ratio, DEFAULT_TEXT_INDEX_HEADER_CACHE_SIZE_RATIO, "The size of the protected queue (in case of SLRU policy) in the text index header cache relative to the cache's total size.", 0) \
+    DECLARE(String, text_index_substring_index_cache_policy, DEFAULT_TEXT_INDEX_SUBSTRING_INDEX_CACHE_POLICY, "Text index substring index cache policy name.", 0) \
+    DECLARE(UInt64, text_index_substring_index_cache_size, DEFAULT_TEXT_INDEX_SUBSTRING_INDEX_CACHE_MAX_SIZE, R"(Size of cache for the substring indexes of text indexes, one entry per data part, loaded as a whole. A working set larger than this is reloaded from disk on every query. Zero means disabled.
+
+<Note>
+This setting can be modified at runtime and will take effect immediately.
+</Note>
+)", 0) \
+    DECLARE(UInt64, text_index_substring_index_cache_max_entries, DEFAULT_TEXT_INDEX_SUBSTRING_INDEX_CACHE_MAX_ENTRIES, "Size of cache for the substring indexes of text indexes in entries. Zero means disabled.", 0) \
+    DECLARE(Double, text_index_substring_index_cache_size_ratio, DEFAULT_TEXT_INDEX_SUBSTRING_INDEX_CACHE_SIZE_RATIO, "The size of the protected queue (in case of SLRU policy) in the text index substring index cache relative to the cache's total size.", 0) \
     DECLARE(String, text_index_postings_cache_policy, DEFAULT_TEXT_INDEX_POSTINGS_CACHE_POLICY, "Text index posting list cache policy name.", 0) \
     DECLARE(UInt64, text_index_postings_cache_size, DEFAULT_TEXT_INDEX_POSTINGS_CACHE_MAX_SIZE, R"(Size of cache for text index posting lists. Zero means disabled.
 
@@ -3696,6 +3705,7 @@ ChangeableSettingsMap collectChangeableServerSettings(ContextPtr context)
             {"vector_similarity_index_cache_size", {std::to_string(context->getVectorSimilarityIndexCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"text_index_tokens_cache_size", {std::to_string(context->getTextIndexTokensCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"text_index_header_cache_size", {std::to_string(context->getTextIndexHeaderCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
+            {"text_index_substring_index_cache_size", {std::to_string(context->getTextIndexSubstringIndexCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"text_index_postings_cache_size", {std::to_string(context->getTextIndexPostingsCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"query_cache_max_size_in_bytes", {std::to_string(context->getQueryResultCache()->maxSizeInBytes()), ChangeableWithoutRestart::Yes}},
             {"point_in_polygon_cache_size", {std::to_string(CurrentMetrics::get(CurrentMetrics::PointInPolygonCacheSizeLimit)), ChangeableWithoutRestart::Yes}},

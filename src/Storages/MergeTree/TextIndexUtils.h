@@ -182,6 +182,10 @@ private:
     SortingQueueBatch<TokenSortCursor> tokens_queue;
     /// Tokens accumulated for the current dictionary block.
     MutableColumnPtr output_tokens;
+    /// All merged tokens, kept only when the index carries a substring index, which is built from them at the end.
+    /// Dropped once they exceed the dictionary size cap: such a part gets no substring index, so there is no reason to hold them.
+    MutableColumnPtr substring_index_tokens;
+    bool substring_index_tokens_dropped = false;
     /// Tokens infos accumulated for the current dictionary block.
     std::vector<TokenPostingsInfo> output_infos;
 

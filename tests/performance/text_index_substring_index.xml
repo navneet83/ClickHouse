@@ -1,0 +1,39 @@
+<test>
+    <settings>
+        <use_query_condition_cache>0</use_query_condition_cache>
+        <use_text_index_like_evaluation_by_dictionary_scan>1</use_text_index_like_evaluation_by_dictionary_scan>
+        <max_threads>1</max_threads>
+    </settings>
+
+    <substitutions>
+        <substitution>
+            <name>table</name>
+            <values>
+                <value>perf_substring_off</value>
+                <value>perf_substring_on</value>
+            </values>
+        </substitution>
+    </substitutions>
+
+    <!-- 32 parts of 62500 rows, every token unique, so each part has a dictionary of 500k tokens and a pattern that
+         is in one token of one part makes the scan read every dictionary block of every part. -->
+    <create_query>
+        CREATE TABLE perf_substring_off (p UInt8, id UInt64, s String, INDEX ix s TYPE text(tokenizer = splitByNonAlpha) GRANULARITY 1)
+        ENGINE = MergeTree PARTITION BY p ORDER BY id SETTINGS max_bytes_to_merge_at_max_space_in_pool = 1
+    </create_query>
+    <create_query>
+        CREATE TABLE perf_substring_on (p UInt8, id UInt64, s String, INDEX ix s TYPE text(tokenizer = splitByNonAlpha, substring_index = 1) GRANULARITY 1)
+        ENGINE = MergeTree PARTITION BY p ORDER BY id SETTINGS max_bytes_to_merge_at_max_space_in_pool = 1, allow_experimental_text_index_substring_index = 1
+    </create_query>
+
+    <fill_query>INSERT INTO perf_substring_off SELECT intDiv(number, 62500), number, concat(arrayStringConcat(arrayMap(i -> concat('u', lower(hex(cityHash64(number, i)))), range(8)), ' '), if(number = 7, ' needle', '')) FROM numbers(2000000) SETTINGS max_insert_threads = 8</fill_query>
+    <fill_query>INSERT INTO perf_substring_on SELECT * FROM perf_substring_off SETTINGS max_insert_threads = 8</fill_query>
+
+    <query>SELECT count() FROM {table} WHERE s LIKE '%abcde%' OR s LIKE '%bcdef%' OR s LIKE '%cdef0%' OR s LIKE '%def01%' OR s LIKE '%ef012%' OR s LIKE '%f0123%' OR s LIKE '%01234%' OR s LIKE '%12345%'</query>
+    <query>SELECT count() FROM {table} WHERE s LIKE '%zzzzz%' OR s LIKE '%yyyyy%' OR s LIKE '%xxxxx%' OR s LIKE '%wwwww%' OR s LIKE '%vvvvv%' OR s LIKE '%uuuuu%' OR s LIKE '%ttttt%' OR s LIKE '%sssss%'</query>
+    <query>SELECT count() FROM {table} WHERE s LIKE '%abcde%' AND s LIKE '%12345%'</query>
+    <query>SELECT count() FROM {table} WHERE hasToken(s, 'needle') AND s LIKE '%abcde%'</query>
+
+    <drop_query>DROP TABLE IF EXISTS perf_substring_off</drop_query>
+    <drop_query>DROP TABLE IF EXISTS perf_substring_on</drop_query>
+</test>

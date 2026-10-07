@@ -667,6 +667,7 @@ struct ContextSharedPart : boost::noncopyable
     mutable TextIndexTokensCachePtr text_index_tokens_cache TSA_GUARDED_BY(mutex);  /// Cache of deserialized text index tokens.
     mutable TextIndexHeaderCachePtr text_index_header_cache TSA_GUARDED_BY(mutex);  /// Cache of deserialized text index headers.
     mutable TextIndexPostingsCachePtr text_index_postings_cache TSA_GUARDED_BY(mutex);  /// Cache of deserialized text index posting lists.
+    mutable TextIndexSubstringIndexCachePtr text_index_substring_index_cache TSA_GUARDED_BY(mutex);  /// Cache of deserialized text index substring indexes.
     mutable QueryConditionCachePtr query_condition_cache TSA_GUARDED_BY(mutex);       /// Cache of matching marks for predicates
     mutable EncryptionHeaderCachePtr encryption_header_cache TSA_GUARDED_BY(mutex);   /// Cache of raw encryption-header bytes by file path
     mutable QueryResultCachePtr query_result_cache TSA_GUARDED_BY(mutex);             /// Cache of query results.
@@ -5418,6 +5419,49 @@ void Context::updateTextIndexHeaderCacheConfiguration(const Poco::Util::Abstract
     shared->text_index_header_cache->setMaxCount(max_entries);
 }
 
+void Context::setTextIndexSubstringIndexCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_entries, double size_ratio)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (shared->text_index_substring_index_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Text index substring index cache has been already created.");
+
+    shared->text_index_substring_index_cache = std::make_shared<TextIndexSubstringIndexCache>(cache_policy, max_size_in_bytes, max_entries, size_ratio);
+}
+
+void Context::updateTextIndexSubstringIndexCacheConfiguration(const Poco::Util::AbstractConfiguration & config, size_t max_cache_size)
+{
+    std::lock_guard lock(shared->mutex);
+
+    if (!shared->text_index_substring_index_cache)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Text index substring index cache was not created yet.");
+
+    size_t size = config.getUInt64("text_index_substring_index_cache_size", DEFAULT_TEXT_INDEX_SUBSTRING_INDEX_CACHE_MAX_SIZE);
+    size_t max_entries = config.getUInt64("text_index_substring_index_cache_max_entries", DEFAULT_TEXT_INDEX_SUBSTRING_INDEX_CACHE_MAX_ENTRIES);
+    if (size > max_cache_size)
+    {
+        size = max_cache_size;
+        LOG_DEBUG(shared->log, "Lowered text index substring index cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(size));
+    }
+    shared->text_index_substring_index_cache->setMaxSizeInBytes(size);
+    shared->text_index_substring_index_cache->setMaxCount(max_entries);
+}
+
+std::shared_ptr<TextIndexSubstringIndexCache> Context::getTextIndexSubstringIndexCache() const
+{
+    SharedLockGuard lock(shared->mutex);
+    return shared->text_index_substring_index_cache;
+}
+
+void Context::clearTextIndexSubstringIndexCache() const
+{
+    auto cache = getTextIndexSubstringIndexCache();
+
+    /// Clear the cache without holding context mutex to avoid blocking context for a long time
+    if (cache)
+        cache->clear();
+}
+
 std::shared_ptr<TextIndexHeaderCache> Context::getTextIndexHeaderCache() const
 {
     SharedLockGuard lock(shared->mutex);
@@ -5818,6 +5862,9 @@ void Context::clearCaches() const
 
     if (shared->text_index_postings_cache)
         shared->text_index_postings_cache->clear();
+
+    if (shared->text_index_substring_index_cache)
+        shared->text_index_substring_index_cache->clear();
 
     if (shared->mmap_cache)
         shared->mmap_cache->clear();

@@ -822,6 +822,17 @@ Allow creating text indexes with the experimental `support_phrase_search` argume
 which stores token positions to support exact phrase matching.
 )", EXPERIMENTAL, \
         {"26.7", false, false, "New setting"}) \
+    DECLARE(Bool, allow_experimental_text_index_substring_index, false, R"(
+Allow creating text indexes with the experimental `substring_index` argument, which stores an index over the dictionary
+so that `LIKE '%needle%'` reads only the dictionary blocks that can hold the needle.
+)", EXPERIMENTAL, \
+        {"26.10", false, false, "New setting"}) \
+    DECLARE(UInt64, text_index_substring_index_max_dictionary_size, 128 * 1024 * 1024, R"(
+A part whose text index dictionary is larger than this many bytes gets no substring index even when the index asks for one
+(`substring_index = 1`). Building the index holds the dictionary and its suffix array in memory, about six times the
+dictionary size, in the thread that writes the part. Such a part answers `LIKE` patterns by the dictionary scan.
+)", EXPERIMENTAL, \
+        {"26.10", 128 * 1024 * 1024, 128 * 1024 * 1024, "New setting"}) \
     DECLARE(MergeTreeTextIndexSerializationVersion, text_index_serialization_version, MergeTreeTextIndexSerializationVersion::V2_WithPositions, R"(
 The preferred on-disk serialization format version for writing text indexes.
 
@@ -837,6 +848,7 @@ Possible values:
 - `v0_initial` — The original format. Does not persist the posting list codec type.
 - `v1_with_codec` — Persists the posting list codec type in the text index header.
 - `v2_with_positions` — Persists token positions for indexes with `support_phrase_search`.
+- `v3_with_substring_index` — Persists a substring index over the dictionary for indexes with `substring_index`.
 )", 0, \
         {"26.8", "v1_with_codec", "v2_with_positions", "Allow the 'v2_with_positions' text index format that persists token positions for phrase search. Reverts to 'v1_with_codec' under older compatibility so that newer servers keep writing the format that older servers can read during a rolling upgrade."}, \
         {"26.6", "v0_initial", "v1_with_codec", "New setting. Controls the on-disk format version of text indexes. Reverts to 'v0_initial' under older compatibility so that newer servers keep writing the previous format that older servers can read during a rolling upgrade."}) \

@@ -263,6 +263,19 @@ void MergeTreeReaderTextIndex::readGranule()
     streams[MergeTreeIndexSubstream::Type::TextIndexDictionary] = dictionary_stream.get();
     streams[MergeTreeIndexSubstream::Type::TextIndexPostings] = small_postings_stream.get();
 
+    /// The substring index, when the part has one, so that a pattern read directly from the index also skips blocks.
+    /// Whether the part has it is a question of its files, like positions, so the physical format decides.
+    std::unique_ptr<MergeTreeIndexReaderStream> substring_index_stream;
+    auto index_format = index.index->getDeserializedFormat(*data_part, index.index->getFileName());
+    for (const auto & substream : index_format.substreams)
+    {
+        if (substream.type == MergeTreeIndexSubstream::Type::TextIndexSubstringIndex)
+        {
+            substring_index_stream = makeTextIndexStream(substream);
+            streams[MergeTreeIndexSubstream::Type::TextIndexSubstringIndex] = substring_index_stream.get();
+        }
+    }
+
     auto granule_ptr = index.index->createIndexGranule();
     granule_ptr->deserializeBinaryWithMultipleStreams(streams, *deserialization_state);
     setIndexGranule(std::move(granule_ptr));
@@ -389,15 +402,15 @@ void MergeTreeReaderTextIndex::initializePositionsStream()
     const auto & data_part = getDataPart();
 
     auto index_format = index.index->getDeserializedFormat(*data_part, index.index->getFileName());
-    if (index_format.version != 2)
-        return;
 
+    /// Whether the part has positions is a question of its substreams, not of the format version: version 3 adds the
+    /// substring index, which a part can have with or without positions.
     const auto positions_substream = std::ranges::find_if(
         index_format.substreams,
         [](const auto & substream) { return substream.type == MergeTreeIndexSubstream::Type::TextIndexPositions; });
 
     if (positions_substream == index_format.substreams.end())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Text index format V2 has no positions substream for index `{}`", index.index->index.name);
+        return;
 
     positions_stream = makeTextIndexInputStream(
         *data_part_info_for_read,

@@ -82,6 +82,7 @@ public:
     explicit TextIndexAnalyzer(const MergeTreeIndexConditionText & condition_text);
 
     bool alwaysFalse() const { return always_false; }
+    const auto & getPatterns() const { return queries_by_pattern; }
     const TokenToPostingsInfosMap & getAllTokenInfos() const { return all_token_infos; }
     const absl::flat_hash_set<String> & getMissingTokens() const { return missing_tokens; }
     const QueryBuilder & getQueryBuilder(const TextSearchQuery & query) const;

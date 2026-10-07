@@ -2,6 +2,7 @@
 
 #include <Interpreters/BloomFilter.h>
 #include <Storages/MergeTree/MergeTreeIndexText.h>
+#include <Storages/MergeTree/TextIndexSubstringIndex.h>
 #include <Storages/MergeTree/PostingListSegment.h>
 
 #include <absl/container/flat_hash_map.h>
@@ -17,6 +18,8 @@ namespace ProfileEvents
     extern const Event TextIndexHeaderCacheMisses;
     extern const Event TextIndexPostingsCacheHits;
     extern const Event TextIndexPostingsCacheMisses;
+    extern const Event TextIndexSubstringIndexCacheHits;
+    extern const Event TextIndexSubstringIndexCacheMisses;
 }
 
 namespace CurrentMetrics
@@ -27,6 +30,8 @@ namespace CurrentMetrics
     extern const Metric TextIndexHeaderCacheCells;
     extern const Metric TextIndexPostingsCacheBytes;
     extern const Metric TextIndexPostingsCacheCells;
+    extern const Metric TextIndexSubstringIndexCacheBytes;
+    extern const Metric TextIndexSubstringIndexCacheCells;
 }
 
 namespace DB
@@ -207,7 +212,44 @@ public:
     }
 };
 
+struct TextIndexSubstringIndexWeightFunction
+{
+    size_t operator()(const TextIndexSubstringIndex & index) const
+    {
+        return index.memoryUsageBytes();
+    }
+};
+
+/// The substring indexes of the parts queried recently, one per part; see `TextIndexSubstringIndex`.
+class TextIndexSubstringIndexCache : public CacheBase<UInt128, TextIndexSubstringIndex, UInt128TrivialHash, TextIndexSubstringIndexWeightFunction>
+{
+public:
+    TextIndexSubstringIndexCache(const String & cache_policy, size_t max_size_in_bytes, size_t max_count, double size_ratio)
+        : CacheBase(cache_policy, CurrentMetrics::TextIndexSubstringIndexCacheBytes, CurrentMetrics::TextIndexSubstringIndexCacheCells, max_size_in_bytes, max_count, size_ratio)
+    {}
+
+    template <typename... Args>
+    static UInt128 hash(Args... args)
+    {
+        SipHash hasher;
+        (hasher.update(args),...);
+        return hasher.get128();
+    }
+
+    template <typename LoadFunc>
+    MappedPtr getOrSet(UInt128 key, LoadFunc && load_func)
+    {
+        auto [cache_entry, cache_miss] = CacheBase::getOrSet(key, load_func);
+        if (cache_miss)
+            ProfileEvents::increment(ProfileEvents::TextIndexSubstringIndexCacheMisses);
+        else
+            ProfileEvents::increment(ProfileEvents::TextIndexSubstringIndexCacheHits);
+        return cache_entry;
+    }
+};
+
 using TextIndexTokensCachePtr = std::shared_ptr<TextIndexTokensCache>;
+using TextIndexSubstringIndexCachePtr = std::shared_ptr<TextIndexSubstringIndexCache>;
 using TextIndexHeaderCachePtr = std::shared_ptr<TextIndexHeaderCache>;
 using TextIndexPostingsCachePtr = std::shared_ptr<TextIndexPostingsCache>;
 

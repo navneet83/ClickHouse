@@ -39,6 +39,7 @@
 #include <Storages/MergeTree/MergeTreeIndexTextPostprocessor.h>
 #include <Storages/MergeTree/TextIndexPositionCodec.h>
 #include <Storages/MergeTree/TextIndexBlockedPositionsCodec.h>
+#include <Storages/MergeTree/TextIndexSubstringIndex.h>
 #include <Storages/MergeTree/MergeTreeIndexTextPreprocessor.h>
 #include <Storages/MergeTree/MergeTreeWriterStream.h>
 #include <Storages/MergeTree/TextIndexCache.h>
@@ -64,6 +65,8 @@ namespace ProfileEvents
     extern const Event TextIndexTokensCacheNegativeHits;
     extern const Event TextIndexTokensCacheNegativeMisses;
     extern const Event TextIndexDiscardPatternScan;
+    extern const Event TextIndexSubstringIndexSearches;
+    extern const Event TextIndexSubstringIndexSelectedBlocks;
 }
 
 namespace DB
@@ -86,6 +89,8 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool text_index_dictionary_block_frontcoding_compression;
     extern const MergeTreeSettingsNonZeroUInt64 text_index_posting_list_block_size;
     extern const MergeTreeSettingsTextIndexPostingListCodec text_index_posting_list_codec;
+    extern const MergeTreeSettingsBool allow_experimental_text_index_substring_index;
+    extern const MergeTreeSettingsUInt64 text_index_substring_index_max_dictionary_size;
     extern const MergeTreeSettingsMergeTreeTextIndexSerializationVersion text_index_serialization_version;
     extern const MergeTreeSettingsBool allow_experimental_text_index_phrase_search;
 }
@@ -93,6 +98,7 @@ namespace MergeTreeSetting
 namespace Setting
 {
     extern const SettingsUInt64 text_index_like_max_postings_to_read;
+    extern const SettingsUInt64 text_index_substring_index_max_occurrences;
     extern const SettingsFloat text_index_hint_max_selectivity;
     extern const SettingsBool use_text_index_negative_tokens_cache;
 }
@@ -101,6 +107,7 @@ namespace Setting
 static_assert(static_cast<UInt64>(MergeTreeTextIndexSerializationVersion::V0_Initial) == 0);
 static_assert(static_cast<UInt64>(MergeTreeTextIndexSerializationVersion::V1_WithCodec) == 1);
 static_assert(static_cast<UInt64>(MergeTreeTextIndexSerializationVersion::V2_WithPositions) == 2);
+static_assert(static_cast<UInt64>(MergeTreeTextIndexSerializationVersion::V3_WithSubstringIndex) == 3);
 static_assert(static_cast<UInt64>(IPostingListCodec::Type::None) == 0);
 static_assert(static_cast<UInt64>(IPostingListCodec::Type::Bitpacking) == 1);
 static_assert(static_cast<UInt64>(IPostingListCodec::Type::PFor) == 2);
@@ -594,7 +601,17 @@ void MergeTreeIndexGranuleText::deserializeBinaryWithMultipleStreams(MergeTreeIn
     positions_codec = text_index_header->positions_codec;
 
     analyzeDictionaryForTokens(text_index_header->sparse_index, *dictionary_stream, state);
-    analyzeDictionaryForPatterns(text_index_header->sparse_index, *dictionary_stream, state);
+
+    /// The substring index is optional and lives in its own substream; a part written without it has none. Only a
+    /// query with patterns reads it, so a token lookup does not pay for loading it.
+    std::shared_ptr<TextIndexSubstringIndex> substring_index;
+    if (text_index_header->has_substring_index && typeid_cast<const MergeTreeIndexConditionText &>(*state.condition).hasSearchPatterns())
+    {
+        auto it = streams.find(MergeTreeIndexSubstream::Type::TextIndexSubstringIndex);
+        if (it != streams.end() && it->second)
+            substring_index = loadSubstringIndex(*it->second, state, index_id_for_caches);
+    }
+    analyzeDictionaryForPatterns(text_index_header->sparse_index, *dictionary_stream, state, substring_index.get());
     if (!state.skip_postings_deserialization)
         analyzePostings(postings_serialization, *postings_stream, state);
 
@@ -707,10 +724,73 @@ void MergeTreeIndexGranuleText::analyzeDictionaryForTokens(
     cardinalities_cache->update(analyzer->getAllTokenInfos(), analyzer->getMissingTokens(), state.part_info.getRowCount());
 }
 
+/// A substring index is read whole and kept per part in a bounded cache, keyed like the other text index caches.
+std::shared_ptr<TextIndexSubstringIndex> MergeTreeIndexGranuleText::loadSubstringIndex(
+    MergeTreeIndexReaderStream & stream, MergeTreeIndexDeserializationState & state, const String & index_id)
+{
+    const auto & condition_text = typeid_cast<const MergeTreeIndexConditionText &>(*state.condition);
+
+    const auto load = [&]
+    {
+        stream.seekToStart();
+        return std::make_shared<TextIndexSubstringIndex>(TextIndexSubstringIndex::deserialize(*stream.getDataBuffer()));
+    };
+
+    return condition_text.substringIndexCache()->getOrSet(TextIndexSubstringIndexCache::hash(index_id), load);
+}
+
+/// Picks the dictionary blocks to read for the patterns from the substring index. Returns false when the index cannot
+/// serve every pattern: no index in this part, a pattern without a literal, a case-insensitive pattern (the dictionary
+/// is case-sensitive), an anchored pattern (the sparse index already seeks to its block range), or a literal with too
+/// many matches.
+bool MergeTreeIndexGranuleText::selectBlocksWithSubstringIndex(
+    const TextIndexSubstringIndex * substring_index, size_t max_occurrences, size_t num_blocks, std::vector<size_t> & blocks) const
+{
+    if (!substring_index)
+        return false;
+
+    const auto & patterns = analyzer->getPatterns();
+    if (patterns.empty())
+        return false;
+
+    /// The index counts the blocks from its separators and the sparse index from the dictionary; they must agree.
+    if (substring_index->numBlocks() != num_blocks)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "Substring index of the text index has {} blocks, the dictionary {}", substring_index->numBlocks(), num_blocks);
+
+    std::vector<size_t> selected;
+    for (const auto & [pattern, _] : patterns)
+    {
+        /// A prefix or an exact literal is already a seek in the sorted dictionary; the substring index is for the rest.
+        const auto literal = pattern->getRequiredSubstring();
+        const auto kind = pattern->getMatchKind();
+        if (literal.empty() || pattern->isCaseInsensitive() || kind == RegexpMatchKind::Prefix || kind == RegexpMatchKind::Exact)
+            return false;
+
+        auto range = substring_index->search(literal);
+        if (!range)
+            continue;
+
+        if (range->second - range->first > max_occurrences)
+            return false;
+
+        auto pattern_blocks = substring_index->blocksOfRange(range->first, range->second);
+        selected.insert(selected.end(), pattern_blocks.begin(), pattern_blocks.end());
+    }
+
+    std::sort(selected.begin(), selected.end());
+    selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
+
+    ProfileEvents::increment(ProfileEvents::TextIndexSubstringIndexSearches, patterns.size());
+    ProfileEvents::increment(ProfileEvents::TextIndexSubstringIndexSelectedBlocks, selected.size());
+    blocks = std::move(selected);
+    return true;
+}
+
 void MergeTreeIndexGranuleText::analyzeDictionaryForPatterns(
     const DictionarySparseIndex & sparse_index,
     MergeTreeIndexReaderStream & dictionary_stream,
-    MergeTreeIndexDeserializationState & state)
+    MergeTreeIndexDeserializationState & state,
+    const TextIndexSubstringIndex * substring_index)
 {
     const auto & condition_text = typeid_cast<const MergeTreeIndexConditionText &>(*state.condition);
     if (!condition_text.hasSearchPatterns())
@@ -720,63 +800,71 @@ void MergeTreeIndexGranuleText::analyzeDictionaryForPatterns(
         return;
 
     const size_t max_postings_to_read = condition_text.getContext()->getSettingsRef()[Setting::text_index_like_max_postings_to_read];
-    const auto block_ranges = blocksMatchingTokenKeyRanges(sparse_index, analyzer->getPatternTokenKeyRanges());
+    /// The blocks to read: those the substring index names for the patterns' literals, if it can serve every pattern,
+    /// otherwise the block ranges of the sparse index, which is every block for a pattern that is not anchored.
+    std::vector<size_t> blocks_to_read;
+    const size_t max_occurrences = condition_text.getContext()->getSettingsRef()[Setting::text_index_substring_index_max_occurrences];
+    if (!selectBlocksWithSubstringIndex(substring_index, max_occurrences, sparse_index.size(), blocks_to_read))
+    {
+        const auto block_ranges = blocksMatchingTokenKeyRanges(sparse_index, analyzer->getPatternTokenKeyRanges());
+        for (const auto & [range_begin, range_end] : block_ranges)
+            for (size_t block_idx = range_begin; block_idx < range_end; ++block_idx)
+                blocks_to_read.push_back(block_idx);
+    }
+
     const bool filter_tokens_by_literals = analyzer->canFilterTokensByLiterals();
 
     size_t postings_to_read = 0;
     std::vector<size_t> matched_indices;
     PaddedPODArray<UInt8> candidate_marks;
-    for (const auto & [range_begin, range_end] : block_ranges)
+    for (size_t block_idx : blocks_to_read)
     {
-        for (size_t block_idx = range_begin; block_idx < range_end; ++block_idx)
+        /// TODO(ahmadov): Include the byte size of token infos into dictionary block to avoid multi-seek.
+        UInt64 offset_in_file = sparse_index.getOffsetInFile(block_idx);
+        dictionary_stream.seekToMark({offset_in_file, 0});
+        auto * data_buffer = dictionary_stream.getDataBuffer();
+
+        ProfileEvents::increment(ProfileEvents::TextIndexReadDictionaryBlocks);
+        auto tokens_column = TextIndexSerialization::deserializeTokens(*data_buffer).first;
+        const auto & block_tokens = assert_cast<const ColumnString &>(*tokens_column);
+        size_t num_tokens = block_tokens.size();
+
+        matched_indices.clear();
+
+        if (filter_tokens_by_literals)
         {
-            /// TODO(ahmadov): Include the byte size of token infos into dictionary block to avoid multi-seek.
-            UInt64 offset_in_file = sparse_index.getOffsetInFile(block_idx);
-            dictionary_stream.seekToMark({offset_in_file, 0});
-            auto * data_buffer = dictionary_stream.getDataBuffer();
-
-            ProfileEvents::increment(ProfileEvents::TextIndexReadDictionaryBlocks);
-            auto tokens_column = TextIndexSerialization::deserializeTokens(*data_buffer).first;
-            const auto & block_tokens = assert_cast<const ColumnString &>(*tokens_column);
-            size_t num_tokens = block_tokens.size();
-
-            matched_indices.clear();
-
-            if (filter_tokens_by_literals)
+            analyzer->matchTokensByLiterals(block_tokens, candidate_marks, matched_indices);
+        }
+        else
+        {
+            for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx)
             {
-                analyzer->matchTokensByLiterals(block_tokens, candidate_marks, matched_indices);
+                const auto & token = block_tokens.getDataAt(token_idx);
+                if (analyzer->addTokenToPatterns(token))
+                    matched_indices.emplace_back(token_idx);
             }
-            else
-            {
-                for (size_t token_idx = 0; token_idx < num_tokens; ++token_idx)
-                {
-                    const auto & token = block_tokens.getDataAt(token_idx);
-                    if (analyzer->addTokenToPatterns(token))
-                        matched_indices.emplace_back(token_idx);
-                }
-            }
+        }
 
-            if (matched_indices.empty())
-                continue;
+        if (matched_indices.empty())
+            continue;
 
-            /// Deserialize only the token infos for matched tokens.
-            auto infos = TextIndexSerialization::deserializeTokenInfos(*data_buffer, num_tokens, matched_indices);
+        /// Deserialize only the token infos for matched tokens.
+        auto infos = TextIndexSerialization::deserializeTokenInfos(*data_buffer, num_tokens, matched_indices);
 
-            for (size_t i = 0; i < matched_indices.size(); ++i)
-            {
-                String token(block_tokens.getDataAt(matched_indices[i]));
-                postings_to_read += !(infos[i]->header & PostingsSerialization::Flags::EmbeddedPostings);
-                analyzer->addTokenInfo(token, infos[i]);
-            }
+        for (size_t i = 0; i < matched_indices.size(); ++i)
+        {
+            String token(block_tokens.getDataAt(matched_indices[i]));
+            postings_to_read += !(infos[i]->header & PostingsSerialization::Flags::EmbeddedPostings);
+            analyzer->addTokenInfo(token, infos[i]);
+        }
 
-            if (postings_to_read > max_postings_to_read)
-            {
-                /// Too many large-posting tokens matched.
-                /// Not all dictionary blocks were scanned, so the set of matched pattern tokens is incomplete.
-                analyzer->bypassPatternQueries();
-                ProfileEvents::increment(ProfileEvents::TextIndexDiscardPatternScan);
-                return;
-            }
+        if (postings_to_read > max_postings_to_read)
+        {
+            /// Too many large-posting tokens matched.
+            /// Not all dictionary blocks were scanned, so the set of matched pattern tokens is incomplete.
+            analyzer->bypassPatternQueries();
+            ProfileEvents::increment(ProfileEvents::TextIndexDiscardPatternScan);
+            return;
         }
     }
 }
@@ -1200,6 +1288,9 @@ void TextIndexSerialization::serializeHeader(const TextIndexHeader & header, Wri
     if (header.has_positions && header.version < MergeTreeTextIndexSerializationVersion::V2_WithPositions)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Text index version {} does not support positions", static_cast<UInt64>(header.version));
 
+    if (header.has_substring_index && header.version < MergeTreeTextIndexSerializationVersion::V3_WithSubstringIndex)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Text index version {} does not support a substring index", static_cast<UInt64>(header.version));
+
     writeVarUInt(static_cast<UInt64>(header.version), ostr);
 
     if (header.version >= MergeTreeTextIndexSerializationVersion::V1_WithCodec)
@@ -1212,6 +1303,9 @@ void TextIndexSerialization::serializeHeader(const TextIndexHeader & header, Wri
         if (header.has_positions)
             writeVarUInt(static_cast<UInt64>(header.positions_codec), ostr);
     }
+
+    if (header.version >= MergeTreeTextIndexSerializationVersion::V3_WithSubstringIndex)
+        writeVarUInt(static_cast<UInt64>(header.has_substring_index), ostr);
 
     /// Sparse indexes are created with raw columns and bit-packed only by optimize.
     /// The write path never calls optimize, so expect the raw columns here.
@@ -1232,7 +1326,7 @@ TextIndexHeader TextIndexSerialization::deserializeHeaderPrefix(ReadBuffer & ist
     UInt64 version = 0;
     readVarUInt(version, istr);
 
-    if (version > static_cast<UInt64>(MergeTreeTextIndexSerializationVersion::V2_WithPositions))
+    if (version > static_cast<UInt64>(MergeTreeTextIndexSerializationVersion::V3_WithSubstringIndex))
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Unsupported version of sparse index ({})", version);
 
     TextIndexHeader header;
@@ -1264,6 +1358,13 @@ TextIndexHeader TextIndexSerialization::deserializeHeaderPrefix(ReadBuffer & ist
                     "Unknown positions codec {} in text index header", positions_codec);
             header.positions_codec = static_cast<UInt8>(positions_codec);
         }
+    }
+
+    if (header.version >= MergeTreeTextIndexSerializationVersion::V3_WithSubstringIndex)
+    {
+        UInt64 has_substring_index = 0;
+        readVarUInt(has_substring_index, istr);
+        header.has_substring_index = has_substring_index != 0;
     }
 
     return header;
@@ -1583,12 +1684,28 @@ void MergeTreeIndexGranuleTextWritable::serializeBinaryWithMultipleStreams(Merge
         *postings_stream,
         positions_stream);
 
+    /// A temporary segment of a merge has no substring index stream: the merged part builds its own, so a segment's
+    /// would never be read.
+    bool has_substring_index = false;
+    auto substring_index_stream = streams.find(MergeTreeIndexSubstream::Type::TextIndexSubstringIndex);
+    if (params.substring_index && substring_index_stream != streams.end() && substring_index_stream->second)
+    {
+        auto substring_index = TextIndexSubstringIndex::build(
+            sorted_tokens.size(), [&](size_t i) { return sorted_tokens[i].token; }, params.dictionary_block_size, params.substring_index_max_dictionary_size);
+        if (substring_index)
+        {
+            substring_index->serialize(substring_index_stream->second->compressed_hashing);
+            has_substring_index = true;
+        }
+    }
+
     TextIndexHeader header
     {
         .version = params.serialization_version,
         .codec_type = posting_list_codec_type,
         .has_positions = params.positions != 0,
         .positions_codec = params.positions_codec,
+        .has_substring_index = has_substring_index,
         .sparse_index = std::move(sparse_index_block),
     };
 
@@ -2114,6 +2231,9 @@ MergeTreeIndexSubstreams MergeTreeIndexText::getSubstreams() const
     if (params.positions)
         substreams.push_back({MergeTreeIndexSubstream::Type::TextIndexPositions, ".pos", ".idx"});
 
+    if (params.substring_index)
+        substreams.push_back({MergeTreeIndexSubstream::Type::TextIndexSubstringIndex, ".fm", ".idx"});
+
     return substreams;
 }
 
@@ -2126,7 +2246,8 @@ MergeTreeIndexSubstreams MergeTreeIndexText::getPotentialSubstreams() const
         {MergeTreeIndexSubstream::Type::Regular, "", ".idx"},
         {MergeTreeIndexSubstream::Type::TextIndexDictionary, ".dct", ".idx"},
         {MergeTreeIndexSubstream::Type::TextIndexPostings, ".pst", ".idx"},
-        {MergeTreeIndexSubstream::Type::TextIndexPositions, ".pos", ".idx"}
+        {MergeTreeIndexSubstream::Type::TextIndexPositions, ".pos", ".idx"},
+        {MergeTreeIndexSubstream::Type::TextIndexSubstringIndex, ".fm", ".idx"}
     };
 }
 
@@ -2143,14 +2264,23 @@ MergeTreeIndexFormat MergeTreeIndexText::getPhysicalFormat(
         {MergeTreeIndexSubstream::Type::TextIndexPostings, ".pst", ".idx"}
     };
 
+    MergeTreeIndexVersion version = 1;
+
     /// V2: positions file exists on disk.
     if (indexFileExistsInChecksums(checksums, relative_path_prefix + ".pos", ".idx", &storage))
     {
         substreams.push_back({MergeTreeIndexSubstream::Type::TextIndexPositions, ".pos", ".idx"});
-        return {2, std::move(substreams)};
+        version = 2;
     }
 
-    return {1, std::move(substreams)};
+    /// V3: the substring index exists on disk.
+    if (indexFileExistsInChecksums(checksums, relative_path_prefix + ".fm", ".idx", &storage))
+    {
+        substreams.push_back({MergeTreeIndexSubstream::Type::TextIndexSubstringIndex, ".fm", ".idx"});
+        version = 3;
+    }
+
+    return {version, std::move(substreams)};
 }
 
 MergeTreeIndexGranulePtr MergeTreeIndexText::createIndexGranule() const
@@ -2195,6 +2325,7 @@ static const String ARGUMENT_DICTIONARY_BLOCK_FRONTCODING_COMPRESSION = "diction
 static const String ARGUMENT_POSTING_LIST_BLOCK_SIZE = "posting_list_block_size";
 static const String ARGUMENT_POSTING_LIST_CODEC = "posting_list_codec";
 static const String ARGUMENT_POSITIONS = "support_phrase_search";
+static const String ARGUMENT_SUBSTRING_INDEX = "substring_index";
 
 namespace
 {
@@ -2300,6 +2431,7 @@ MergeTreeIndexPtr textIndexCreator(StorageMetadataPtr metadata_snapshot, const I
         .value_or(settings[MergeTreeSetting::text_index_posting_list_block_size]);
 
     UInt64 positions = extractFieldOption<UInt64>(options, ARGUMENT_POSITIONS).value_or(DEFAULT_POSITIONS);
+    UInt64 substring_index = extractFieldOption<UInt64>(options, ARGUMENT_SUBSTRING_INDEX).value_or(0);
 
     String posting_list_codec_name = extractFieldOption<String>(options, ARGUMENT_POSTING_LIST_CODEC)
         .value_or(settings[MergeTreeSetting::text_index_posting_list_codec].toString());
@@ -2311,13 +2443,16 @@ MergeTreeIndexPtr textIndexCreator(StorageMetadataPtr metadata_snapshot, const I
     /// If the setting contradicts the index features on the current version, the index features take precedence.
     using enum MergeTreeTextIndexSerializationVersion;
     MergeTreeTextIndexSerializationVersion min_version = V0_Initial;
-    MergeTreeTextIndexSerializationVersion max_version = V2_WithPositions;
+    MergeTreeTextIndexSerializationVersion max_version = V3_WithSubstringIndex;
 
     if (has_codec)
         min_version = V1_WithCodec;
 
     if (positions)
         min_version = V2_WithPositions;
+
+    if (substring_index)
+        min_version = V3_WithSubstringIndex;
 
     const MergeTreeTextIndexSerializationVersion version_setting = settings[MergeTreeSetting::text_index_serialization_version];
     MergeTreeTextIndexSerializationVersion serialization_version = std::clamp(version_setting, min_version, max_version);
@@ -2330,7 +2465,9 @@ MergeTreeIndexPtr textIndexCreator(StorageMetadataPtr metadata_snapshot, const I
         static_cast<UInt8>(TextIndexPositionCodec::Encoding::BlockedPfor), /// not user-configurable yet
         std::move(preprocessor_ast),
         std::move(postprocessor_ast),
-        serialization_version};
+        serialization_version,
+        substring_index,
+        settings[MergeTreeSetting::text_index_substring_index_max_dictionary_size]};
 
     if (!options.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected text index arguments: {}", fmt::join(std::views::keys(options), ", "));
@@ -2368,6 +2505,20 @@ void textIndexValidator(const IndexDescription & index, bool /*attach*/, const M
     UInt64 positions = extractFieldOption<UInt64>(options, ARGUMENT_POSITIONS).value_or(DEFAULT_POSITIONS);
     if (positions > 1)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Text index argument '{}' must be 0 or 1, but got {}", ARGUMENT_POSITIONS, positions);
+
+    UInt64 substring_index = extractFieldOption<UInt64>(options, ARGUMENT_SUBSTRING_INDEX).value_or(0);
+    if (substring_index > 1)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Text index argument '{}' must be 0 or 1, but got {}", ARGUMENT_SUBSTRING_INDEX, substring_index);
+
+    if (substring_index && !settings[MergeTreeSetting::allow_experimental_text_index_substring_index])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Text index argument '{}' is experimental. Enable it with the MergeTree setting "
+            "`allow_experimental_text_index_substring_index = 1`.", ARGUMENT_SUBSTRING_INDEX);
+
+    /// The substring index stores the block size as 32 bits.
+    if (substring_index && dictionary_block_size > std::numeric_limits<UInt32>::max())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Text index argument '{}' must be at most {} with a substring index, but got {}",
+            ARGUMENT_DICTIONARY_BLOCK_SIZE, std::numeric_limits<UInt32>::max(), dictionary_block_size);
 
     if (positions && !settings[MergeTreeSetting::allow_experimental_text_index_phrase_search])
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,

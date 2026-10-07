@@ -94,6 +94,7 @@ CREATE TABLE table
                                 [, preprocessor = expression(str)]
                                 [, postprocessor = expression(str)]
                                 [, support_phrase_search = 0 | 1 ] -- experimental
+                                [, substring_index = 0 | 1 ] -- experimental
                                 -- Optional advanced parameters:
                                 [, dictionary_block_size = D]
                                 [, dictionary_block_frontcoding_compression = B]
@@ -134,6 +135,7 @@ ALTER TABLE table
                                 [, preprocessor = expression(str)]
                                 [, postprocessor = expression(str)]
                                 [, support_phrase_search = 0 | 1 ] -- experimental
+                                [, substring_index = 0 | 1 ] -- experimental
                                 -- Optional advanced parameters:
                                 [, dictionary_block_size = D]
                                 [, dictionary_block_frontcoding_compression = B]
@@ -575,6 +577,28 @@ Set `support_phrase_search = 0` (the default) to keep the posting-list-only stor
 <Warning>
 This argument is experimental and should only be used for testing.
 Set MergeTree setting [`allow_experimental_text_index_phrase_search`](/reference/settings/merge-tree-settings/allow-experimental#allow_experimental_text_index_phrase_search) to enable storing positions.
+</Warning>
+
+**Substring index argument (optional, experimental)**.
+
+The optional `substring_index` argument controls whether a text index stores an additional substring index over its token dictionary. The default is `0`.
+
+When `substring_index = 1`, ClickHouse can speed up patterns such as `LIKE '%needle%'`. Without this index, ClickHouse scans the token dictionary of each part block by block to find the tokens that contain the needle (see [LIKE/ILIKE queries](#like-ilike-queries-perf)). With the substring index, ClickHouse first finds the dictionary blocks that may contain the needle, and then runs the existing matcher only on those blocks.
+
+This is most useful when the needle appears in only a small number of tokens. If the literal appears more than [`text_index_substring_index_max_occurrences`](/reference/settings/session-settings/text-index#text_index_substring_index_max_occurrences) times in a part's token dictionary, ClickHouse falls back to the normal dictionary scan.
+
+The substring index is not created or used in these cases:
+
+- the part's dictionary is larger than the MergeTree setting [`text_index_substring_index_max_dictionary_size`](/reference/settings/merge-tree-settings/text-index#text_index_substring_index_max_dictionary_size)
+- the dictionary contains a token with the byte `0x00` or `0x01`
+- the pattern is case-insensitive, such as `ILIKE`
+- the pattern is anchored at the start, which can already use the sorted dictionary
+
+The substring index is roughly the size of the dictionary text and adds build cost, so it is opt-in.
+
+<Warning>
+This feature is experimental. The on-disk format is not stable and may change in a future release.
+To create a text index with `substring_index = 1`, enable the MergeTree setting [`allow_experimental_text_index_substring_index`](/reference/settings/merge-tree-settings/allow-experimental#allow_experimental_text_index_substring_index).
 </Warning>
 
 <details markdown="1">
@@ -1606,7 +1630,7 @@ Each text index consists of two (abstract) data structures:
 Text index is built for the whole part.
 Unlike other skip indexes, text index can be merged instead of rebuilt on merge of the data parts (see below).
 
-During index creation, three files are created (per part):
+During index creation, three files are created (per part), plus up to two optional ones:
 
 **Dictionary blocks file (.dct)**
 
@@ -1629,6 +1653,11 @@ If the posting list is larger than `posting_list_block_size`, it is split into m
 
 Optional, only if index argument `support_phrase_search = 1`.
 Stores the positions of the tokens within matching rows.
+
+**Substring index file (.fm)**
+
+Optional, only if index argument `substring_index = 1`.
+Stores an [FM-index](https://en.wikipedia.org/wiki/FM-index) of the sorted tokens of the part, which maps a substring to the dictionary blocks whose tokens contain it.
 
 **Merging of text indexes**
 
