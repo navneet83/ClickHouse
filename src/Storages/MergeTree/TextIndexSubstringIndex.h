@@ -11,44 +11,51 @@
 namespace DB
 {
 
-/** A substring index over the dictionary of a text index: an FM-index of the sorted tokens.
+/** A substring index over the dictionary of a text index: an FM-index of the sorted tokens of one part.
   *
-  * The text is `SEP t0 SEP t1 ... SEP t(d-1) TERM`, with the separator and the terminator the two smallest bytes and
-  * both excluded from tokens. The index stores the Burrows-Wheeler transform of that text; a pattern `%needle%` is
-  * answered with one rank step per byte of the needle, which gives the range of suffixes starting with it, and the
-  * occurrence count is known before anything is located.
+  * Text. The tokens are concatenated as `SEP t0 SEP t1 ... SEP t(d-1) TERM`, where `TERM` = 0x00 and `SEP` = 0x01
+  * are the two smallest byte values and may not occur in a token. Every substring of a token is then a prefix of
+  * some suffix of this text, and a substring that would cross a token boundary has to contain `SEP`.
   *
-  * Locating uses the order of the dictionary instead of a sampled suffix array: the suffixes that start at a separator
-  * are the d smallest after the terminator, and because the tokens are sorted and distinct they come in token order,
-  * so the suffix-array row of the separator before token i is i + 1. Walking LF from a match inside a token reaches
-  * that row after as many steps as the match is deep in the token, and the row gives the token and its dictionary
-  * block. Tokens longer than `HYBRID_STRIDE` bytes carry a sample every `HYBRID_STRIDE` bytes so that the walk is
-  * bounded for them too.
+  * Search. Sorting all suffixes gives the suffix array; the suffixes starting with a needle form one contiguous range
+  * of rows in it. The index does not store the suffix array. It stores the Burrows-Wheeler transform (BWT): for each
+  * row, the byte just before that suffix. With the table `C` (how many bytes of the text are smaller than a byte) and
+  * `rank` (how often a byte occurs in the BWT before a row), the range is found by backward search, one step per
+  * byte of the needle from its last byte to its first. The size of the range is the number of occurrences, known
+  * before any dictionary block is read.
   *
-  * On disk: the BWT, the rows of the samples inside long tokens with their blocks, and a few scalars; the counts
-  * the search needs are derived from the BWT when the index is loaded. The loader checks the shape of the sample
-  * table but not its values: verifying one sample costs an LF walk of up to `HYBRID_STRIDE` steps, so a wrong block
-  * stored for a sample is left to the part checksums, like the BWT itself.
+  * Locate. A row is mapped to a dictionary block without a sampled suffix array. Row 0 is the suffix `TERM`; rows
+  * 1..d are the suffixes that start with `SEP`, and since the tokens are sorted and distinct they are in token order,
+  * so row i + 1 is the separator before token i and its block is i / `tokens_per_block`. The LF mapping moves from a
+  * row to the row of the suffix that starts one byte earlier, so a match that starts at byte k of a token (counting
+  * from 1) reaches that token's separator row after k steps. Tokens longer than `HYBRID_STRIDE` bytes have a sample
+  * every `HYBRID_STRIDE` bytes, stored as its row and block, so that no walk takes more than `HYBRID_STRIDE` steps.
+  *
+  * On disk: a format version, three scalars, the BWT, and the sample rows with their blocks. `C`, the alphabet and
+  * the occurrence counts are rebuilt from the BWT on load. The loader checks the shape of the sample table (sorted,
+  * in range) but not each block value, which would cost a walk per sample; a damaged value is left to the part
+  * checksums, as is a damaged BWT.
   */
 class TextIndexSubstringIndex
 {
 public:
     static constexpr UInt8 SEPARATOR = 0x01;
     static constexpr UInt8 TERMINATOR = 0x00;
-    /// Inside a token longer than this, every such byte is a sample; the LF walk never takes more steps than this.
+    /// Inside a token longer than this, every `HYBRID_STRIDE`-th byte is a sample, so a locate walk takes at most
+    /// this many steps.
     static constexpr UInt32 HYBRID_STRIDE = 64;
 
     /// Builds the index over `num_tokens` tokens in dictionary order, distinct; `get_token(i)` returns the i-th token.
-    /// Returns nothing when the index is not built: a token holds the separator or the terminator byte, or the text
-    /// is longer than `max_text_size`.
+    /// Returns nothing when a token contains the separator or the terminator byte, or the text is longer than
+    /// `max_text_size`.
     static std::optional<TextIndexSubstringIndex> build(
         size_t num_tokens, const std::function<std::string_view(size_t)> & get_token, size_t tokens_per_block, size_t max_text_size);
 
     void serialize(WriteBuffer & out) const;
     static TextIndexSubstringIndex deserialize(ReadBuffer & in);
 
-    /// The half-open range of suffixes that start with `needle`, in suffix-array order, or nothing if there are none.
-    /// Its size is the number of occurrences of the needle in the dictionary, counted with multiplicity.
+    /// The half-open range of suffix-array rows that start with `needle`, or nothing if there are none. Its size is the
+    /// number of occurrences in the dictionary, so a token that contains the needle twice counts twice.
     std::optional<std::pair<UInt32, UInt32>> search(std::string_view needle) const;
 
     /// The dictionary blocks holding the tokens of the suffix range, sorted and without duplicates.
@@ -70,21 +77,23 @@ private:
     UInt32 occurrence_block = 512;
     UInt32 tokens_per_block = 0;
 
-    /// Persisted: the BWT (the last column of the sorted rotations).
+    /// Persisted: the BWT, byte `i` is the byte before the suffix in row `i` (the last column of the sorted rotations).
     std::string bwt;
-    /// Persisted: the suffix-array rows of the samples inside long tokens, increasing, and the block of each.
+    /// Persisted: the rows of the samples inside long tokens, increasing, and the block of each, for `locateBlock`.
     std::vector<UInt32> hybrid_rows;
     std::vector<UInt32> hybrid_blocks;
 
     /// Derived: the number of tokens (separators in the BWT) and of dictionary blocks.
     UInt32 num_tokens = 0;
     UInt32 num_blocks = 0;
-    /// Derived: for each byte value, the number of smaller bytes in the text; 257 entries so that C[c + 1] ends c's bucket.
+    /// Derived: `C[c]` is the number of bytes in the text smaller than `c`, which is the first row whose suffix starts
+    /// with `c`; 257 entries, so `C[c + 1]` ends that range.
     std::vector<UInt32> C;
-    /// Derived: compact alphabet, only the byte values that occur get a symbol.
+    /// Derived: only the byte values that occur get a symbol, which keeps `occurrences` small for a small alphabet.
     std::vector<UInt16> symbol_of_byte;
     std::vector<UInt8> byte_of_symbol;
-    /// Derived: occurrence counts of every symbol before every `occurrence_block`-th position.
+    /// Derived: the count of every symbol before each multiple of `occurrence_block`; `rank` adds the rest by scanning
+    /// at most `occurrence_block` bytes of the BWT.
     std::vector<UInt32> occurrences;
 };
 

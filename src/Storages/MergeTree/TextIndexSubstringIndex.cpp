@@ -30,7 +30,7 @@ bool hasStructuralByte(std::string_view s)
         || s.find(static_cast<char>(TextIndexSubstringIndex::SEPARATOR)) != std::string_view::npos;
 }
 
-/// Suffix array in linear time by induced sorting (libsais), in memory of 4 bytes per text byte plus the text.
+/// Suffix array by induced sorting (libsais), linear time; needs 4 bytes per text byte on top of the text.
 std::vector<Int32> buildSuffixArray(const std::string & text)
 {
     std::vector<Int32> suffix_array(text.size());
@@ -47,8 +47,8 @@ void writeVector(const std::vector<T> & v, WriteBuffer & out)
     out.write(reinterpret_cast<const char *>(v.data()), v.size() * sizeof(T));
 }
 
-/// The sizes come from the file, so they are read in steps: a damaged size then fails on the data that is not there
-/// instead of allocating what it claims first.
+/// The size comes from the file, so the data is read in 1 MiB steps: a damaged size fails on the missing data instead
+/// of allocating everything it claims first.
 template <typename Container>
 void readInSteps(Container & v, ReadBuffer & in, size_t size)
 {
@@ -97,16 +97,18 @@ std::optional<TextIndexSubstringIndex> TextIndexSubstringIndex::build(
     for (size_t i = 0; i < num_tokens_; ++i)
     {
         const auto token = get_token(i);
-        /// The two bytes are structural, so a token holding one would break the order of the separator rows.
+        /// A token containing `SEP` or `TERM` would break the token order of the separator rows, so such a part gets
+        /// no index.
         if (hasStructuralByte(token))
             return {};
         const size_t boundary = text.size();
         text += static_cast<char>(SEPARATOR);
         text += token;
-        /// A dictionary beyond the cap, or beyond the signed 32-bit offsets of the suffix array construction, gets no
-        /// substring index; the pattern scan still works without one.
+        /// libsais uses signed 32-bit offsets, and the cap bounds build memory; above either the part gets no index and
+        /// patterns use the dictionary scan.
         if (text.size() > max_text_size || text.size() >= static_cast<size_t>(std::numeric_limits<Int32>::max()))
             return {};
+        /// Offset `boundary + m` is byte m - 1 of the token, so samples sit at token bytes 63, 127, ...
         if (token.size() > HYBRID_STRIDE)
             for (size_t m = HYBRID_STRIDE; m <= token.size(); m += HYBRID_STRIDE)
                 samples.emplace_back(static_cast<UInt32>(boundary + m), static_cast<UInt32>(i / tokens_per_block_));
@@ -116,6 +118,7 @@ std::optional<TextIndexSubstringIndex> TextIndexSubstringIndex::build(
 
     auto suffix_array = buildSuffixArray(text);
 
+    /// The BWT byte of a row is the byte before its suffix; the suffix at offset 0 wraps around to `TERM`.
     index.bwt.resize(index.text_size);
     for (UInt32 i = 0; i < index.text_size; ++i)
     {
@@ -123,8 +126,8 @@ std::optional<TextIndexSubstringIndex> TextIndexSubstringIndex::build(
         index.bwt[i] = text[(offset + index.text_size - 1) % index.text_size];
     }
 
-    /// The rows of the samples come out increasing because the suffix array is walked in order. The samples are in
-    /// text order already, so a bit per text byte marks them and the block is found by a binary search.
+    /// Walking the suffix array in row order emits the sample rows increasing, as `locateBlock` needs. A bit per text
+    /// byte marks the samples, and the block comes from a binary search in `samples`, which is in text order.
     if (!samples.empty())
     {
         std::vector<bool> is_sample(index.text_size, false);
@@ -171,7 +174,8 @@ void TextIndexSubstringIndex::buildDerivedTables()
     const size_t num_occurrence_blocks = text_size / occurrence_block + 1;
     occurrences.assign(num_occurrence_blocks * num_symbols, 0);
     std::vector<UInt32> running(num_symbols, 0);
-    /// The counts before position i, for every i that starts a block; `rank(symbol, text_size)` needs the one after the last byte.
+    /// One checkpoint per `occurrence_block` positions, including position `text_size`, which `rank` at the end of the
+    /// range needs.
     for (UInt32 i = 0; i <= text_size; ++i)
     {
         if (i % occurrence_block == 0)
@@ -214,12 +218,13 @@ TextIndexSubstringIndex TextIndexSubstringIndex::deserialize(ReadBuffer & in)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "Substring index of the text index is corrupted: BWT of {} bytes for a text of {}", bwt_size, index.text_size);
     readInSteps(index.bwt, in, index.text_size);
 
-    /// A sample every `HYBRID_STRIDE` bytes at most, so the table cannot be larger than that.
+    /// There is at most one sample per `HYBRID_STRIDE` bytes of text.
     readVector(index.hybrid_rows, in, index.text_size / HYBRID_STRIDE);
     readVector(index.hybrid_blocks, in, index.text_size / HYBRID_STRIDE);
 
-    /// The index selects the blocks to read, so a value that is in range but wrong would drop matching tokens.
-    /// Every invariant of a valid build that can be checked at this cost is checked here, and a failure is an error.
+    /// The index decides which blocks are read, so a damaged index can silently drop matches. The checks below are the
+    /// ones that cost no walk: one terminator, matching sample tables, sample rows increasing and above the separator
+    /// rows, and blocks in range.
     index.buildDerivedTables();
 
     if (index.C[TERMINATOR + 1] != 1)
@@ -230,7 +235,7 @@ TextIndexSubstringIndex TextIndexSubstringIndex::deserialize(ReadBuffer & in)
 
     for (size_t i = 0; i < index.hybrid_rows.size(); ++i)
     {
-        /// A sample sits inside a token, so its row is above the terminator row and the separator rows.
+        /// A sample suffix starts inside a token, so its row is after row 0 (`TERM`) and rows 1..d (`SEP`).
         const UInt32 row = index.hybrid_rows[i];
         if (row <= index.num_tokens || row >= index.text_size || (i > 0 && row <= index.hybrid_rows[i - 1]) || index.hybrid_blocks[i] >= index.num_blocks)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "Substring index of the text index is corrupted: sample row {} with block {} out of order or out of range", row, index.hybrid_blocks[i]);
@@ -239,6 +244,7 @@ TextIndexSubstringIndex TextIndexSubstringIndex::deserialize(ReadBuffer & in)
     return index;
 }
 
+/// The number of occurrences of `symbol` in `bwt[0, position)`: the checkpoint of its block plus a scan of the rest.
 UInt32 TextIndexSubstringIndex::rank(UInt16 symbol, UInt32 position) const
 {
     const UInt32 block = position / occurrence_block;
@@ -251,10 +257,12 @@ UInt32 TextIndexSubstringIndex::rank(UInt16 symbol, UInt32 position) const
 
 std::optional<std::pair<UInt32, UInt32>> TextIndexSubstringIndex::search(std::string_view needle) const
 {
-    /// A needle with a structural byte matches no token; without this it could match across a token boundary.
+    /// No token contains `SEP` or `TERM`, so such a needle matches nothing; searching it could match across tokens.
     if (needle.empty() || hasStructuralByte(needle))
         return {};
 
+    /// Backward search: after the step for byte k, [begin, end) holds the rows whose suffix starts with needle[k..].
+    /// Prepending byte c keeps the rows whose BWT byte is c and maps them into the rows starting with c, from `C[c]`.
     UInt32 begin = 0;
     UInt32 end = text_size;
     for (size_t k = needle.size(); k-- > 0;)
@@ -271,6 +279,7 @@ std::optional<std::pair<UInt32, UInt32>> TextIndexSubstringIndex::search(std::st
     return std::make_pair(begin, end);
 }
 
+/// LF mapping: the row of the suffix that starts one byte before the suffix in row `position`.
 UInt32 TextIndexSubstringIndex::lf(UInt32 position) const
 {
     const UInt8 byte = bwt[position];
@@ -279,10 +288,11 @@ UInt32 TextIndexSubstringIndex::lf(UInt32 position) const
 
 UInt32 TextIndexSubstringIndex::locateBlock(UInt32 row) const
 {
-    /// Each LF step moves one byte back in the token; the separator row, or a sample inside a long token, is reached
-    /// within `HYBRID_STRIDE` steps, so a longer walk means the BWT is damaged.
+    /// Each LF step moves the suffix one byte back in its token. The token's separator row, or a sample of a long
+    /// token, is reached within `HYBRID_STRIDE` steps, so a longer walk means the index is damaged.
     for (UInt32 steps = 0;; ++steps)
     {
+        /// Rows 1..d are the separators in token order, so row r is the separator of token r - 1.
         if (row != 0 && row <= num_tokens)
             return (row - 1) / tokens_per_block;
 
